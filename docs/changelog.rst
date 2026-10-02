@@ -1,6 +1,24 @@
 Changelog for DBUtils
 +++++++++++++++++++++
 
+3.2.1
+=====
+
+DBUtils 3.2.1 has not been released yet.
+
+Changes:
+
+* Made ``PooledDB`` and ``PersistentDB`` fork-safe.  When a process is
+  forked after a pool or generator has been created (for instance, when
+  a web service preloads the pool and then forks worker processes), the
+  child process no longer uses the connections and locks inherited from
+  the parent process, but starts over with a fresh pool state on first
+  use and creates its own connections with the original creator and
+  session settings.  Connections that had been checked out by the parent
+  process are rejected in the child process, and inherited connections
+  are never rolled back or closed in the child process, so that
+  transactions in progress in the parent process are not disturbed.
+
 3.2.0
 =====
 

@@ -19,6 +19,11 @@ This means the same thread always uses the same cached connection,
 and no other thread will use it.  So even if the underlying DB-API module
 is not thread-safe at the connection level this will be no problem here.
 
+The generator is also safe against forking: When the process is forked after
+the generator has been created, the child process will not use the
+connections inherited from the parent process, but open its own
+connections on first use.
+
 For best performance, the application server should keep threads persistent.
 For this, you have to set MinServerThreads = MaxServerThreads in Webware.
 
@@ -117,6 +122,8 @@ Copyright, credits and license:
 
 Licensed under the MIT license.
 """
+
+import os
 
 from . import __version__
 from .steady_db import connect
@@ -222,7 +229,33 @@ class PersistentDB:
         self._ping = ping
         self._closeable = closeable
         self._args, self._kwargs = args, kwargs
-        self.thread = (threadlocal or local)()
+        self._pid = os.getpid()  # the process in which this was created
+        self._threadlocal = threadlocal or local
+        self.thread = self._threadlocal()
+
+    def _check_pid(self):
+        """Check whether we are in the process that created the generator.
+
+        If the process has been forked after the generator was created,
+        the child process must not use the inherited connections, since
+        they belong to the parent process.  In this case, start over
+        with a fresh thread-local storage for the connections.
+
+        The inherited connection is deliberately not closed or rolled
+        back, since this could disturb a transaction that is in progress
+        in the parent process.  It is only marked as closed so that it
+        will not be closed by the garbage collector either.
+        """
+        pid = os.getpid()
+        if pid != self._pid:
+            self._pid = pid
+            try:
+                con = self.thread.connection
+            except AttributeError:
+                pass
+            else:
+                con._closed = True  # do not close inherited connections
+            self.thread = self._threadlocal()
 
     def steady_connection(self):
         """Get a steady, non-persistent DB-API 2 connection."""
@@ -238,6 +271,7 @@ class PersistentDB:
         PooledDB connection method.  In reality, persistent connections
         are of course never shared with other threads.
         """
+        self._check_pid()
         try:
             con = self.thread.connection
         except AttributeError as error:

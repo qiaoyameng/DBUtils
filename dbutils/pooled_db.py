@@ -20,6 +20,12 @@ If the underlying DB-API module is thread-safe at the connection level,
 the requested connections may be shared with other threads by default,
 but you can also request dedicated connections in case you need them.
 
+The pool is also safe against forking: When the process is forked after
+the pool has been created, the child process will not use the connections
+and locks inherited from the parent process, but start over with a fresh
+pool state on first use.  Connections that had been checked out by the
+parent process cannot be used in the child process any more.
+
 For the Python DB-API 2 specification, see:
     https://www.python.org/dev/peps/pep-0249/
 For information on Webware for Python, see:
@@ -153,6 +159,7 @@ Copyright, credits and license:
 Licensed under the MIT license.
 """
 
+import os
 from contextlib import suppress
 from functools import total_ordering
 from threading import Condition
@@ -306,6 +313,7 @@ class PooledDB:
             self._maxconnections = maxconnections
         else:
             self._maxconnections = 0
+        self._pid = os.getpid()  # the process in which the pool was created
         self._idle_cache = []  # the actual pool of idle connections
         self._lock = Condition()
         self._connections = 0
@@ -313,6 +321,33 @@ class PooledDB:
         idle = [self.dedicated_connection() for i in range(mincached)]
         while idle:
             idle.pop().close()
+
+    def _check_pid(self):
+        """Check whether the pool is used in the process that created it.
+
+        If the process has been forked after the pool was created, the
+        child process must not use the inherited pool state: The cached
+        connections belong to the parent process, and the lock may be
+        held by a thread that does not exist in the child process.
+        In this case, start over with a fresh, empty pool state.
+
+        The inherited connections are deliberately not closed or rolled
+        back, since this could disturb transactions that are in progress
+        in the parent process.  They are only marked as closed so that
+        they will not be closed by the garbage collector either.
+        """
+        pid = os.getpid()
+        if pid != self._pid:
+            self._pid = pid
+            for con in self._idle_cache:
+                con._closed = True  # do not close inherited connections
+            self._idle_cache = []
+            if self._maxshared:
+                for shared_con in self._shared_cache:
+                    shared_con.con._closed = True
+                self._shared_cache = []
+            self._lock = Condition()
+            self._connections = 0
 
     def steady_connection(self):
         """Get a steady, unpooled DB-API 2 connection."""
@@ -327,6 +362,7 @@ class PooledDB:
         If shareable is set and the underlying DB-API 2 allows it,
         then the connection may be shared with other threads.
         """
+        self._check_pid()
         if shareable and self._maxshared:
             with self._lock:
                 while True:
@@ -386,6 +422,7 @@ class PooledDB:
 
     def unshare(self, con):
         """Decrease the share of a connection in the shared cache."""
+        self._check_pid()
         with self._lock:
             con.unshare()
             shared = con.shared
@@ -398,6 +435,7 @@ class PooledDB:
 
     def cache(self, con):
         """Put a dedicated connection back into the idle cache."""
+        self._check_pid()
         with self._lock:
             if not self._maxcached or len(self._idle_cache) < self._maxcached:
                 con._reset(force=self._reset)  # rollback possible transaction
@@ -410,6 +448,7 @@ class PooledDB:
 
     def close(self):
         """Close all connections in the pool."""
+        self._check_pid()
         with self._lock:
             while self._idle_cache:  # close all idle connections
                 con = self._idle_cache.pop(0)
@@ -451,6 +490,7 @@ class PooledDedicatedDBConnection:
         """
         # basic initialization to make finalizer work
         self._con = None
+        self._pid = os.getpid()
         # proper initialization of the connection
         if not con.threadsafety():
             raise NotSupportedError("Database module is not thread-safe.")
@@ -462,12 +502,18 @@ class PooledDedicatedDBConnection:
         # Instead of actually closing the connection,
         # return it to the pool for future reuse.
         if self._con:
-            self._pool.cache(self._con)
+            if self._pid == os.getpid():
+                self._pool.cache(self._con)
+            else:
+                # The process has been forked and the connection belongs
+                # to the parent process, so it must not be returned to
+                # the pool, rolled back or closed in the child process.
+                self._con._closed = True
             self._con = None
 
     def __getattr__(self, name):
         """Proxy all members of the class."""
-        if self._con:
+        if self._con and self._pid == os.getpid():
             return getattr(self._con, name)
         raise InvalidConnectionError
 
@@ -540,6 +586,7 @@ class PooledSharedDBConnection:
         """
         # basic initialization to make finalizer work
         self._con = None
+        self._pid = os.getpid()
         # proper initialization of the connection
         con = shared_con.con
         if not con.threadsafety() > 1:
@@ -553,12 +600,18 @@ class PooledSharedDBConnection:
         # Instead of actually closing the connection,
         # unshare it and/or return it to the pool.
         if self._con:
-            self._pool.unshare(self._shared_con)
+            if self._pid == os.getpid():
+                self._pool.unshare(self._shared_con)
+            else:
+                # The process has been forked and the connection belongs
+                # to the parent process, so it must not be returned to
+                # the pool, rolled back or closed in the child process.
+                self._con._closed = True
             self._shared_con = self._con = None
 
     def __getattr__(self, name):
         """Proxy all members of the class."""
-        if self._con:
+        if self._con and self._pid == os.getpid():
             return getattr(self._con, name)
         raise InvalidConnectionError
 
