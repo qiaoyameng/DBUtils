@@ -12,6 +12,8 @@ Copyright and credit info:
 import pytest
 
 from dbutils.steady_db import (
+    REPLAY_STAGE_AFTER_EXECUTION,
+    REPLAY_STAGE_BEFORE_EXECUTION,
     InvalidCursorError,
     SteadyDBConnection,
     SteadyDBCursor,
@@ -788,6 +790,230 @@ def test_connection_set_sizes():
     cursor.execute('get sizes')
     result = cursor.fetchone()
     assert result == ([6, 42, 7], {None: 7, 3: 15, 9: 42})
+
+
+def test_replay_policy_must_be_callable():
+    """Check that the replay policy must be a callable when it is given."""
+    steady_db_connect(dbapi, replay_policy=None)
+    steady_db_connect(dbapi, replay_policy=lambda *args: True)
+    with pytest.raises(TypeError):
+        steady_db_connect(dbapi, replay_policy='always')
+    with pytest.raises(TypeError):
+        steady_db_connect(dbapi, replay_policy=42)
+
+
+def test_execute_replay_policy_allows_replay_after_write_once():
+    """Check that an allowing policy keeps the current replay behavior."""
+    dbapi.Connection.num_executions = 0
+    dbapi.Connection.num_writes = 0
+    dbapi.Cursor.fail_insert_once = True
+    db = steady_db_connect(
+        dbapi, replay_policy=lambda *args: True)
+    cursor = db.cursor()
+    cursor.execute('insert fail once')
+    assert dbapi.Connection.num_executions == 2
+    assert dbapi.Connection.num_writes == 2
+    assert db._con.session == ['insert fail once']
+    assert db._con.valid
+
+
+def test_execute_replay_policy_denies_replay_after_write_once():
+    """Check that denying a write replay prevents a second physical write."""
+    dbapi.Connection.num_executions = 0
+    dbapi.Connection.num_writes = 0
+    dbapi.Cursor.fail_insert_once = True
+    decisions = []
+
+    def policy(operation, in_transaction, stage, error):
+        decisions.append((operation, in_transaction, stage, str(error)))
+        return False
+
+    db = steady_db_connect(dbapi, replay_policy=policy)
+    cursor = db.cursor()
+    with pytest.raises(dbapi.OperationalError, match='after write'):
+        cursor.execute('insert fail once')
+    assert dbapi.Connection.num_executions == 1
+    assert dbapi.Connection.num_writes == 1
+    assert db._con.session == []
+    assert decisions == [(
+        'insert fail once', False,
+        REPLAY_STAGE_AFTER_EXECUTION, 'connection lost after write')]
+    # rejecting the replay does recover the connection for the next operation
+    assert db._con.valid
+    cursor.execute('select after recovery')
+    assert cursor.fetchone() == 'after recovery'
+    assert dbapi.Connection.num_executions == 2
+
+
+def test_execute_replay_policy_denial_returns_original_when_recovery_fails():
+    """Check that failed recovery does not replace the original error."""
+    dbapi.Connection.num_executions = 0
+    dbapi.Connection.num_writes = 0
+    dbapi.Cursor.fail_insert_once = True
+    db = steady_db_connect(
+        dbapi, database='ok', replay_policy=lambda *args: False)
+    cursor = db.cursor()
+    db._kwargs['database'] = 'error'
+    with pytest.raises(dbapi.OperationalError, match='after write'):
+        cursor.execute('insert fail once')
+    assert dbapi.Connection.num_executions == 1
+    assert dbapi.Connection.num_writes == 1
+    db._kwargs['database'] = 'ok'
+    cursor = db.cursor()
+    cursor.execute('select after recovery')
+    assert cursor.fetchone() == 'after recovery'
+    assert dbapi.Connection.num_executions == 2
+
+
+def test_execute_replay_policy_applies_to_maxusage_reset():
+    """Check that maxusage resets the connection but still honors a policy."""
+    dbapi.Connection.num_executions = 0
+    db = steady_db_connect(
+        dbapi, 1, replay_policy=lambda *args: False)
+    cursor = db.cursor()
+    cursor.execute('select first')
+    assert cursor.fetchone() == 'first'
+    with pytest.raises(dbapi.OperationalError):
+        cursor.execute('insert not replayed')
+    assert dbapi.Connection.num_executions == 1
+    assert db._usage == 0
+    cursor = db.cursor()
+    cursor.execute('select after reset')
+    assert cursor.fetchone() == 'after reset'
+    assert dbapi.Connection.num_executions == 2
+
+
+def test_execute_replay_policy_can_allow_replay_before_execution():
+    """Check that a failure before execution can safely be replayed."""
+    dbapi.Connection.num_executions = 0
+    dbapi.Connection.num_writes = 0
+    dbapi.Cursor.fail_before_execute_once = True
+    decisions = []
+
+    def policy(operation, in_transaction, stage, error):
+        decisions.append((operation, in_transaction, stage, str(error)))
+        return stage == REPLAY_STAGE_BEFORE_EXECUTION
+
+    db = steady_db_connect(dbapi, replay_policy=policy)
+    cursor = db.cursor()
+    cursor.execute('select before execution')
+    assert cursor.fetchone() == 'before execution'
+    assert dbapi.Connection.num_executions == 1
+    assert decisions == [(
+        'select before execution', False,
+        REPLAY_STAGE_BEFORE_EXECUTION,
+        'connection lost before execution')]
+
+
+def test_execute_replay_policy_denied_before_execution_recovers():
+    """Check that a denied pre-execution replay still returns its error."""
+    dbapi.Connection.num_executions = 0
+    dbapi.Connection.num_writes = 0
+    dbapi.Cursor.fail_before_execute_once = True
+    db = steady_db_connect(
+        dbapi, replay_policy=lambda *args: False)
+    cursor = db.cursor()
+    with pytest.raises(dbapi.OperationalError, match='before execution'):
+        cursor.execute('select denied')
+    assert dbapi.Connection.num_executions == 0
+    assert db._con.valid
+    cursor.execute('select after recovery')
+    assert cursor.fetchone() == 'after recovery'
+    assert dbapi.Connection.num_executions == 1
+
+
+def test_execute_replay_policy_sees_explicit_transaction():
+    """Check that policies can distinguish explicit transactions."""
+    dbapi.Connection.num_executions = 0
+    dbapi.Connection.num_writes = 0
+    decision = []
+
+    def policy(operation, in_transaction, stage, error):
+        decision.append((operation, in_transaction, stage, str(error)))
+        return not in_transaction
+
+    db = steady_db_connect(dbapi, replay_policy=policy)
+    cursor = db.cursor()
+    db.begin()
+    cursor._cursor.valid = False
+    db._con.valid = False
+    with pytest.raises(dbapi.InternalError):
+        cursor.execute('select in transaction')
+    assert dbapi.Connection.num_executions == 0
+    assert decision[0][:3] == (
+        'select in transaction', True,
+        REPLAY_STAGE_AFTER_EXECUTION)
+    assert not db._transaction
+    assert db._con.valid
+
+
+def test_executemany_replay_policy_uses_complete_arguments():
+    """Check that executemany replays with all parameters from an iterator."""
+    dbapi.Connection.num_executions = 0
+    dbapi.Connection.num_writes = 0
+    dbapi.Cursor.fail_executemany_after_second_once = True
+    decisions = []
+
+    def policy(operation, in_transaction, stage, error):
+        decisions.append((operation, in_transaction, stage, str(error)))
+        return False
+
+    def parameters():
+        yield 1
+        yield 2
+        yield 3
+
+    db = steady_db_connect(dbapi, replay_policy=policy)
+    cursor = db.cursor()
+    with pytest.raises(dbapi.OperationalError, match='batch write'):
+        cursor.executemany('insert row', parameters())
+    assert dbapi.Connection.num_executions == 1
+    assert dbapi.Connection.num_writes == 2
+    assert db._con.session == []
+    assert decisions[0][:3] == (
+        'insert row', False,
+        REPLAY_STAGE_AFTER_EXECUTION)
+    cursor.executemany('insert row', parameters())
+    assert dbapi.Connection.num_executions == 2
+    assert dbapi.Connection.num_writes == 5
+    assert db._con.session == [
+        ('insert row', 1), ('insert row', 2), ('insert row', 3)]
+
+
+def test_executemany_default_replays_complete_arguments():
+    """Check that default replay materializes one-shot parameter iterators."""
+    dbapi.Connection.num_executions = 0
+    dbapi.Connection.num_writes = 0
+    dbapi.Cursor.fail_executemany_after_second_once = True
+
+    def parameters():
+        yield 1
+        yield 2
+        yield 3
+
+    db = steady_db_connect(dbapi)
+    cursor = db.cursor()
+    cursor.executemany('insert row', parameters())
+    assert dbapi.Connection.num_executions == 2
+    assert dbapi.Connection.num_writes == 5
+    assert db._con.session == [
+        ('insert row', 1), ('insert row', 2), ('insert row', 3)]
+
+
+def test_replay_policy_denial_keeps_cursor_sizes():
+    """Check that a recovery cursor gets the stored input and output sizes."""
+    dbapi.Cursor.fail_insert_once = True
+    db = steady_db_connect(
+        dbapi, replay_policy=lambda *args: False)
+    cursor = db.cursor()
+    cursor.setinputsizes([7, 42, 6])
+    cursor.setoutputsize(9)
+    cursor.setoutputsize(15, 3)
+    with pytest.raises(dbapi.OperationalError, match='after write'):
+        cursor.execute('insert fail once')
+    cursor.execute('get sizes')
+    assert cursor.fetchone() == (
+        [7, 42, 6], {None: 9, 3: 15})
 
 
 def test_connection_ping(ping_con_cls):

@@ -15,6 +15,12 @@ Changes:
   failed statement, such as a deliberate server side statement timeout, from
   errors that report a broken connection, when the database module maps both
   onto the same exception class.
+* Added a ``replay_policy`` parameter to ``PersistentDB``, ``PooledDB`` and
+  ``steady_db.connect()``.  The optional callable can decide whether an
+  operation may be replayed after a connection failure, based on the
+  operation name, explicit transaction state, failure stage and original
+  exception.  Rejecting a replay still recovers the connection
+  for subsequent operations, while raising the original exception.
 * The ``ping`` parameter of ``PersistentDB``, ``PooledDB`` and
   ``steady_db.connect()`` now also accepts an SQL statement such as
   ``"select 1"`` or a callable that shall be used for checking the

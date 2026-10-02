@@ -5,11 +5,27 @@ import pytest
 from . import mock_db
 
 
-@pytest.fixture
+@pytest.fixture(autouse=True)
 def dbapi():
     """Get the mock DB-API 2 module."""
+    con_cls = mock_db.Connection
+    cursor_cls = mock_db.Cursor
     mock_db.threadsafety = 2
-    return mock_db
+    con_cls.num_pings = 0
+    con_cls.num_timeouts = 0
+    con_cls.num_executions = 0
+    con_cls.num_writes = 0
+    cursor_cls.fail_insert_once = False
+    cursor_cls.fail_before_execute_once = False
+    cursor_cls.fail_executemany_after_second_once = False
+    yield mock_db
+    con_cls.num_pings = 0
+    con_cls.num_timeouts = 0
+    con_cls.num_executions = 0
+    con_cls.num_writes = 0
+    cursor_cls.fail_insert_once = False
+    cursor_cls.fail_before_execute_once = False
+    cursor_cls.fail_executemany_after_second_once = False
 
 
 @pytest.fixture

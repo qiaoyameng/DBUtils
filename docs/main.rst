@@ -256,6 +256,13 @@ of ``PersistentDB``, passing the following parameters:
   shall be applied (must be passed as a keyword argument, see
   `Controlling the failover mechanism`_)
 
+* ``replay_policy``: an optional callable that decides whether an operation
+  may be replayed after a connection failure.  It receives the operation
+  name, a flag for an explicit transaction, the failure stage
+  (``before_execute`` or ``after_execute``) and the original exception.  A
+  false value still recovers the connection, but raises the original error
+  without replaying the operation.
+
 * ``ping``: an optional flag controlling when connections are checked
   (``0`` = ``None`` = never, ``1`` = default = whenever it is requested,
   ``2`` = when a cursor is created, ``4`` = when a query is executed,
@@ -363,6 +370,13 @@ following parameters:
   has been raised and shall return whether the connection failover mechanism
   shall be applied (must be passed as a keyword argument, see
   `Controlling the failover mechanism`_)
+
+* ``replay_policy``: an optional callable that decides whether an operation
+  may be replayed after a connection failure.  It receives the operation
+  name, a flag for an explicit transaction, the failure stage
+  (``before_execute`` or ``after_execute``) and the original exception.  A
+  false value still recovers the connection, but raises the original error
+  without replaying the operation.
 
 * ``ping``: an optional flag controlling when connections are checked
   (``0`` = ``None`` = never, ``1`` = default = whenever fetched from the pool,
@@ -501,6 +515,32 @@ so it is raised to the application immediately, and the connection is neither
 replaced nor removed from the pool. Note that ``isfatal`` must be passed as a
 keyword argument, and that it must tolerate arbitrary exception instances of
 the classes given as ``failures``.
+
+The ``isfatal`` callable decides whether the connection is broken, but not
+whether a particular operation is safe to send again.  Some drivers raise a
+connection error only after a write statement has already reached the
+database, so transparently replaying it could duplicate the write.  For these
+cases you can pass a ``replay_policy`` callable::
+
+    def replay_policy(operation, transaction, stage, error):
+        operation = operation.lstrip().lower()
+        if transaction:
+            return False
+        if (stage == 'after_execute'
+                and not operation.startswith('select ')):
+            return False
+        return True
+
+    pool = PooledDB(pymysql, 5, database='mydb', replay_policy=replay_policy)
+
+The callable receives the operation name, a flag showing whether the
+connection is in an explicit transaction, the failure stage
+(``before_execute`` or ``after_execute``) and the original exception.
+When it returns a false value, the connection is still recovered for
+subsequent operations, but the original error is raised and the operation is
+not sent again.  Passing no policy keeps the previous replay behavior.  The
+parameters of ``executemany()`` are materialized before the first execution,
+so a one-shot parameter iterator can be replayed with its full contents.
 
 If you only want to suppress the failover mechanism for a particular
 statement instead of configuring it for the whole pool, you can use the

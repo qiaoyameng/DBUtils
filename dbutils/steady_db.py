@@ -97,7 +97,12 @@ from . import __version__
 __all__ = [
     'connect', 'SteadyDBConnection', 'SteadyDBCursor',
     'SteadyDBError', 'InvalidCursorError',
+    'REPLAY_STAGE_BEFORE_EXECUTION', 'REPLAY_STAGE_AFTER_EXECUTION',
 ]
+
+
+REPLAY_STAGE_BEFORE_EXECUTION = 'before_execute'
+REPLAY_STAGE_AFTER_EXECUTION = 'after_execute'
 
 
 class SteadyDBError(Exception):
@@ -134,7 +139,7 @@ def _sql_pinger(sql):
 def connect(
         creator, maxusage=None, setsession=None,
         failures=None, ping=1, closeable=True, isfatal=None,
-        *args, **kwargs):
+        *args, replay_policy=None, **kwargs):
     """Create a "tough" connection.
 
     A hardened version of the connection function of a DB-API 2 module.
@@ -162,6 +167,13 @@ def connect(
         when the database module maps both onto the same exception class.
         The callable must tolerate arbitrary exception instances of the
         classes given as failures, including instances without args.
+    replay_policy: an optional callable that is passed the operation name
+        (SQL statement or stored procedure), whether the connection is in
+        an explicit transaction, the failure stage and the original
+        exception.  A true return value permits replaying the operation.
+        A false value only recovers the connection for subsequent
+        operations and then raises the original exception again.  When this
+        is None, operations are replayed as before.
     ping: determines when and how the connection shall be checked
         (0 = None = never, 1 = default = when _ping_check() is called,
         2 = whenever a cursor is created, 4 = when a query is executed,
@@ -184,7 +196,8 @@ def connect(
     """
     return SteadyDBConnection(
         creator, maxusage, setsession,
-        failures, ping, closeable, isfatal, *args, **kwargs)
+        failures, ping, closeable, isfatal,
+        *args, replay_policy=replay_policy, **kwargs)
 
 
 class SteadyDBConnection:
@@ -195,7 +208,7 @@ class SteadyDBConnection:
     def __init__(
             self, creator, maxusage=None, setsession=None,
             failures=None, ping=1, closeable=True, isfatal=None,
-            *args, **kwargs):
+            *args, replay_policy=None, **kwargs):
         """Create a "tough" DB-API 2 connection."""
         # basic initialization to make finalizer work
         self._con = None
@@ -242,6 +255,9 @@ class SteadyDBConnection:
         if isfatal is not None and not callable(isfatal):
             raise TypeError("'isfatal' must be a callable.")
         self._isfatal = isfatal
+        if replay_policy is not None and not callable(replay_policy):
+            raise TypeError("'replay_policy' must be a callable.")
+        self._replay_policy = replay_policy
         self._ping, self._pinger = self._parse_ping(ping)
         self._closeable = closeable
         self._args, self._kwargs = args, kwargs
@@ -715,6 +731,54 @@ class SteadyDBCursor:
             else:
                 cursor.setoutputsize(size, column)
 
+    def _replay_allowed(self, operation, transaction, stage, error):
+        """Ask the configured replay policy whether an operation may repeat."""
+        policy = self._con._replay_policy
+        return policy is None or policy(
+            operation, bool(transaction), stage, error)
+
+    def _apply_sizes(self, cursor):
+        """Apply stored cursor sizes, without masking recovery errors."""
+        with suppress(Exception):
+            self._setsizes(cursor)
+
+    def _recover_without_replay(self, method_name, transaction):
+        """Recover the connection after an operation was not replayed."""
+        try:
+            if transaction:
+                con2 = self._con._create()
+                cursor2 = con2.cursor(*self._args, **self._kwargs)
+                if method_name.startswith('execute'):
+                    self._apply_sizes(cursor2)
+                self.close()
+                self._con._close()
+                self._con._store(con2)
+                self._cursor = cursor2
+                self._closed = False
+                self._con._transaction = False
+            else:
+                cursor2 = None
+                try:
+                    cursor2 = self._con._cursor(
+                        *self._args, **self._kwargs)
+                except Exception:
+                    con2 = self._con._create()
+                    cursor2 = con2.cursor(*self._args, **self._kwargs)
+                    self.close()
+                    self._con._close()
+                    self._con._store(con2)
+                if method_name.startswith('execute'):
+                    self._apply_sizes(cursor2)
+                self.close()
+                self._cursor = cursor2
+                self._closed = False
+        except Exception:
+            # Recovery is best effort; the original failure is what the
+            # caller must see.  A later call can attempt recovery again.
+            if transaction:
+                self._con._transaction = False
+        raise
+
     def close(self):
         """Close the tough cursor.
 
@@ -733,7 +797,13 @@ class SteadyDBCursor:
             transaction = con._transaction
             if not transaction:
                 con._ping_check(4)
+            if execute and name == 'executemany' and len(args) > 1:
+                # A generator or other one-shot iterator would only contain
+                # the remaining parameters after a partial first execution.
+                args = args[:1] + (tuple(args[1]),) + args[2:]
+            operation = args[0] if args else None
             overused = False
+            stage = REPLAY_STAGE_BEFORE_EXECUTION
             try:
                 # check whether the connection has been used too often
                 if (con._maxusage and con._usage >= con._maxusage
@@ -743,6 +813,7 @@ class SteadyDBCursor:
                 if execute:
                     self._setsizes()
                 method = getattr(self._cursor, name)
+                stage = REPLAY_STAGE_AFTER_EXECUTION
                 result = method(*args, **kwargs)  # try to execute
                 if execute:
                     self._clearsizes()
@@ -752,6 +823,9 @@ class SteadyDBCursor:
                 if not overused and (
                         self._no_failover or not con._fatal_check(error)):
                     raise
+                if not self._replay_allowed(
+                        operation, transaction, stage, error):
+                    self._recover_without_replay(name, transaction)
                 if not transaction:
                     try:
                         cursor2 = con._cursor(
@@ -771,6 +845,7 @@ class SteadyDBCursor:
                         else:
                             self.close()
                             self._cursor = cursor2
+                            self._closed = False
                             con._usage += 1
                             return result
                         with suppress(Exception):
@@ -815,6 +890,7 @@ class SteadyDBCursor:
                             con._close()
                             con._store(con2)
                             self._cursor = cursor2
+                            self._closed = False
                             con._usage += 1
                             if error2:
                                 raise error2  # raise the other error

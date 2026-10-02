@@ -379,6 +379,17 @@ def test_isfatal(dbapi):
     assert cursor.fetchone() == 'test'
 
 
+def test_replay_policy(dbapi):
+    """Check that replay policies are passed on to steady connections."""
+    def deny_write(operation, in_transaction, stage, error):
+        return not operation.startswith('insert ')
+
+    persist = PersistentDB(dbapi, replay_policy=deny_write)
+    assert persist._replay_policy is deny_write
+    db = persist.connection()
+    assert db._replay_policy is deny_write
+
+
 def test_no_failover(dbapi):
     """Check that no_failover() suspends the failover mechanism."""
     persist = PersistentDB(dbapi)

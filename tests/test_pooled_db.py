@@ -1627,6 +1627,17 @@ def test_isfatal(dbapi):
     assert cursor.fetchone() == 'test'
 
 
+def test_replay_policy(dbapi):
+    """Check that replay policies are passed on to steady connections."""
+    def deny_write(operation, in_transaction, stage, error):
+        return not operation.startswith('insert ')
+
+    pool = PooledDB(dbapi, 1, replay_policy=deny_write)
+    assert pool._replay_policy is deny_write
+    db = pool.connection()
+    assert db._con._replay_policy is deny_write
+
+
 def test_no_failover(dbapi):
     """Check that no_failover() suspends the failover mechanism."""
     pool = PooledDB(dbapi, 1)

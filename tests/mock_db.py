@@ -35,6 +35,8 @@ class Connection:
 
     has_ping = False
     num_pings = 0
+    num_executions = 0
+    num_writes = 0
     # number of statements that ran into a deliberate server side timeout,
     # counted on the class since the failover may use a new connection
     num_timeouts = 0
@@ -48,6 +50,8 @@ class Connection:
         self.open_cursors = 0
         self.num_uses = 0
         self.num_queries = 0
+        self.num_executions = 0
+        self.num_writes = 0
         self.num_pings = 0
         self.session = []
         self.valid = True
@@ -58,6 +62,8 @@ class Connection:
         self.open_cursors = 0
         self.num_uses = 0
         self.num_queries = 0
+        self.num_executions = 0
+        self.num_writes = 0
         self.session = []
         self.valid = False
 
@@ -87,6 +93,10 @@ class Connection:
 
 class Cursor:
 
+    fail_insert_once = False
+    fail_before_execute_once = False
+    fail_executemany_after_second_once = False
+
     def __init__(self, con, name=None):
         self.con = con
         self.valid = False
@@ -104,13 +114,33 @@ class Cursor:
         self.con.open_cursors -= 1
         self.valid = False
 
+    def __getattribute__(self, name):
+        if name in ('execute', 'executemany'):
+            cls = object.__getattribute__(self, '__class__')
+            if cls.fail_before_execute_once:
+                cls.fail_before_execute_once = False
+                con = object.__getattribute__(self, 'con')
+                con.valid = False
+                raise OperationalError('connection lost before execution')
+        return super().__getattribute__(name)
+
     def execute(self, operation):
         if not self.valid or not self.con.valid:
             raise InternalError
         self.con.num_uses += 1
+        type(self.con).num_executions += 1
+        self.con.num_executions += 1
         if operation.startswith('select '):
             self.con.num_queries += 1
             self.result = operation[7:]
+        elif operation.startswith('insert '):
+            type(self.con).num_writes += 1
+            self.con.num_writes += 1
+            self.con.session.append(operation)
+            if operation == 'insert fail once' and self.fail_insert_once:
+                type(self).fail_insert_once = False
+                self.con.valid = False
+                raise OperationalError('connection lost after write')
         elif operation.startswith('set '):
             self.con.session.append(operation[4:])
             self.result = None
@@ -124,6 +154,29 @@ class Cursor:
             self.result = (self.inputsizes, self.outputsizes)
             self.inputsizes = []
             self.outputsizes = {}
+        else:
+            raise ProgrammingError
+
+    def executemany(self, operation, seq_of_parameters):
+        if not self.valid or not self.con.valid:
+            raise InternalError
+        type(self.con).num_executions += 1
+        self.con.num_executions += 1
+        self.con.num_uses += 1
+        if operation.startswith('insert '):
+            cls = type(self)
+            for index, parameter in enumerate(seq_of_parameters):
+                type(self.con).num_writes += 1
+                self.con.num_writes += 1
+                self.con.session.append((operation, parameter))
+                if (index == 1
+                        and cls.fail_executemany_after_second_once):
+                    cls.fail_executemany_after_second_once = False
+                    self.con.valid = False
+                    raise OperationalError(
+                        'connection lost during batch write')
+        elif operation.startswith('select '):
+            self.con.num_queries += 1
         else:
             raise ProgrammingError
 
