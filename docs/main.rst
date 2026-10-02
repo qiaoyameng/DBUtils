@@ -341,6 +341,15 @@ following parameters:
   If this is set to true, block and wait until the number of
   connections decreases, but by default an error will be reported.
 
+  For an individual request, you can also pass ``timeout`` to
+  ``connection()``, setting the maximum number of seconds to wait for an
+  available connection. The timeout uses a monotonic clock and includes all
+  waits in the same request, including waits after spurious wakeups. A value
+  of ``0`` makes one immediate attempt, and ``None`` follows the
+  ``blocking`` setting. It only bounds waiting for a connection slot or a
+  shareable connection; creating a new connection and checking its health are
+  not counted against the timeout.
+
 * ``maxusage``: maximum number of reuses of a single connection
   (the default of ``0`` or ``None`` means unlimited reuse)
 
@@ -391,6 +400,11 @@ Once you have set up the connection pool you can request database connections
 from that pool::
 
   db = pool.connection()
+
+If the pool is full, you can limit how long the request waits for a
+connection to become available::
+
+  db = pool.connection(timeout=0.2)
 
 You can use these connections just as if they were ordinary DB-API 2
 connections. Actually what you get is the hardened ``steady_db`` version of

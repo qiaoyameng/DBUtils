@@ -11,7 +11,7 @@ Copyright and credit info:
 """
 
 from queue import Empty, Queue
-from threading import Thread
+from threading import Barrier, Event, Thread
 
 import pytest
 
@@ -23,6 +23,72 @@ from dbutils.pooled_db import (
     TooManyConnectionsError,
 )
 from dbutils.steady_db import SteadyDBConnection
+
+
+class FakeClock:
+    """A controllable monotonic clock."""
+
+    def __init__(self):
+        self.now = 0.0
+
+    def monotonic(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+
+class FakeCondition:
+    """A condition synchronized by a barrier and driven by a fake clock."""
+
+    def __init__(self, barrier):
+        self._barrier = barrier
+        self._event = None
+        self.spurious_wakeups = 0
+
+    def acquire(self):
+        pass
+
+    def release(self):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def wait(self, timeout=None):
+        if timeout is not None and timeout <= 0:
+            return False
+        event = Event()
+        self._event = event
+        self._barrier.wait(timeout=1)
+        if self.spurious_wakeups:
+            self.spurious_wakeups -= 1
+            return True
+        return event.wait(timeout)
+
+    def notify(self):
+        self._event.set()
+
+    def notify_all(self):
+        self._event.set()
+
+
+def full_pool(dbapi, shareable):
+    """Create and fill a pool that forces the requested path to wait."""
+    maxshared = 1 if shareable else 0
+    pool = PooledDB(dbapi, 0, 0, maxshared, 1, True)
+    holder = pool.connection(True)
+    if shareable:
+        holder.begin()
+    return pool, holder
+
+
+def shared_cache_len(pool):
+    """Return the shared cache length for shareable and dedicated pools."""
+    return len(getattr(pool, '_shared_cache', []))
 
 
 def test_version():
@@ -1063,6 +1129,133 @@ def test_maxconnections_blocking(dbapi, threadsafety):
     assert session == ['rollback', 'rollback', 'thread', 'rollback']
     assert db
     del db
+
+
+@pytest.mark.parametrize("shareable", [False, True])
+def test_connection_timeout_full_pool_and_spurious_wakeup(
+        dbapi, monkeypatch, shareable):
+    """Check that a full pool times out across spurious wakeups."""
+    from dbutils import pooled_db
+
+    clock = FakeClock()
+    pool, holder = full_pool(dbapi, shareable)
+    barrier = Barrier(2)
+    pool._lock = FakeCondition(barrier)
+    monkeypatch.setattr(pooled_db, 'monotonic', clock.monotonic)
+    result = []
+
+    def get_connection():
+        try:
+            result.append(pool.connection(shareable, timeout=1))
+        except Exception as error:
+            result.append(error)
+
+    thread = Thread(target=get_connection)
+    thread.start()
+    barrier.wait(timeout=1)
+    clock.advance(0.5)
+    pool._lock.spurious_wakeups += 1
+    barrier.wait(timeout=1)
+    assert thread.is_alive()
+    clock.advance(0.5)
+    pool._lock.spurious_wakeups += 1
+    thread.join(0.1)
+
+    assert not thread.is_alive()
+    assert len(result) == 1
+    assert isinstance(result[0], TooManyConnectionsError)
+    assert pool._connections == 1
+    assert len(pool._idle_cache) == 0
+    assert shared_cache_len(pool) == (1 if shareable else 0)
+
+
+@pytest.mark.parametrize("shareable", [False, True])
+def test_connection_timeout_return_at_deadline(
+        dbapi, monkeypatch, shareable):
+    """Check that a return at the deadline still satisfies the waiter."""
+    from dbutils import pooled_db
+
+    clock = FakeClock()
+    pool, holder = full_pool(dbapi, shareable)
+    barrier = Barrier(2)
+    pool._lock = FakeCondition(barrier)
+    monkeypatch.setattr(pooled_db, 'monotonic', clock.monotonic)
+    result = []
+
+    def get_connection():
+        try:
+            result.append(pool.connection(shareable, timeout=1))
+        except Exception as error:
+            result.append(error)
+
+    thread = Thread(target=get_connection)
+    thread.start()
+    barrier.wait(timeout=1)
+    clock.advance(1)
+    holder.close()
+    thread.join(0.1)
+
+    assert not thread.is_alive()
+    assert not result or not isinstance(result[0], Exception)
+    assert len(result) == 1
+    assert pool._connections == 1
+    result[0].close()
+    assert pool._connections == 0
+    assert len(pool._idle_cache) == 1
+    assert shared_cache_len(pool) == 0
+
+
+@pytest.mark.parametrize("shareable", [False, True])
+def test_connection_timeout_zero(dbapi, shareable):
+    """Check that a zero timeout makes only one immediate attempt."""
+    pool, holder = full_pool(dbapi, shareable)
+    with pytest.raises(TooManyConnectionsError):
+        pool.connection(shareable, timeout=0)
+    assert pool._connections == 1
+    assert shared_cache_len(pool) == (1 if shareable else 0)
+    holder.close()
+    db = pool.dedicated_connection(timeout=0)
+    db.close()
+
+
+@pytest.mark.parametrize("shareable", [False, True])
+@pytest.mark.parametrize("timeout", [-1, float('nan'), '1'])
+def test_connection_timeout_invalid(dbapi, shareable, timeout):
+    """Reject invalid timeouts before changing the state of the pool."""
+    pool, holder = full_pool(dbapi, shareable)
+    with pytest.raises((TypeError, ValueError)):
+        pool.connection(shareable, timeout=timeout)
+    assert pool._connections == 1
+    assert len(pool._idle_cache) == 0
+    assert shared_cache_len(pool) == (1 if shareable else 0)
+    holder.close()
+
+
+@pytest.mark.parametrize("shareable", [False, True])
+@pytest.mark.parametrize("stage", ["create", "ping"])
+def test_connection_timeout_excludes_create_and_ping(
+        dbapi, monkeypatch, shareable, stage):
+    """Check that creation and health checks are outside wait timeout."""
+    from dbutils import pooled_db
+
+    clock = FakeClock()
+    maxshared = 1 if shareable else 0
+    if stage == 'ping':
+        pool = PooledDB(dbapi, 1, 1, maxshared)
+        con = pool._idle_cache[0]
+        monkeypatch.setattr(
+            con, '_ping_check', lambda: clock.advance(10))
+    else:
+        pool = PooledDB(dbapi, 0, 0, maxshared)
+        steady_connection = pool.steady_connection
+        monkeypatch.setattr(
+            pool, 'steady_connection',
+            lambda: (clock.advance(10), steady_connection())[1])
+    monkeypatch.setattr(pooled_db, 'monotonic', clock.monotonic)
+
+    db = pool.connection(shareable, timeout=0)
+    assert clock.now == 10
+    db.close()
 
 
 @pytest.mark.parametrize("threadsafety", [1, 2])

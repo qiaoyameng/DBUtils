@@ -90,6 +90,14 @@ database connections from that pool:
 
     db = pool.connection()
 
+If the pool is full, you can limit how long to wait for a connection
+to become available for an individual request:
+
+    db = pool.connection(timeout=0.2)
+
+The timeout uses a monotonic clock and does not cover creating a
+new connection or checking its health.
+
 You can use these connections just as if they were ordinary
 DB-API 2 connections.  Actually what you get is the hardened
 SteadyDB version of the underlying DB-API 2 connection.
@@ -153,9 +161,11 @@ Copyright, credits and license:
 Licensed under the MIT license.
 """
 
+import math
 from contextlib import suppress
 from functools import total_ordering
 from threading import Condition
+from time import monotonic
 
 from . import __version__
 from .steady_db import connect
@@ -321,18 +331,28 @@ class PooledDB:
             self._failures, self._ping, True, self._isfatal,
             *self._args, **self._kwargs)
 
-    def connection(self, shareable=True):
+    def connection(self, shareable=True, timeout=None):
         """Get a steady, cached DB-API 2 connection from the pool.
 
         If shareable is set and the underlying DB-API 2 allows it,
         then the connection may be shared with other threads.
+
+        timeout sets the maximum number of seconds to wait for a
+        connection to become available.  It is measured with a monotonic
+        clock and applies to repeated waits caused by spurious wakeups.
+        A value of 0 makes only one immediate attempt, while None waits
+        according to the blocking setting of the pool.  The timeout only
+        covers waiting for a connection slot or a shareable connection;
+        creating a new connection and checking its health are not included.
         """
+        timeout = self._check_timeout(timeout)
         if shareable and self._maxshared:
             with self._lock:
+                deadline = None
                 while True:
                     while (not self._shared_cache and self._maxconnections
                             and self._connections >= self._maxconnections):
-                        self._wait_lock()
+                        deadline = self._wait_lock(timeout, deadline)
                     if len(self._shared_cache) < self._maxshared:
                         # shared cache is not full, get a dedicated connection
                         try:  # first try to get it from the idle cache
@@ -354,7 +374,7 @@ class PooledDB:
                         # wait until the situation has changed and start over,
                         # since by then the connection may have become idle
                         # and been removed from the shared cache altogether
-                        self._wait_lock()
+                        deadline = self._wait_lock(timeout, deadline)
                         continue
                     del self._shared_cache[0]  # get it
                     con.con._ping_check()  # check the underlying connection
@@ -366,9 +386,10 @@ class PooledDB:
             con = PooledSharedDBConnection(self, con)
         else:  # try to get a dedicated connection
             with self._lock:
+                deadline = None
                 while (self._maxconnections
                         and self._connections >= self._maxconnections):
-                    self._wait_lock()
+                    deadline = self._wait_lock(timeout, deadline)
                 # connection limit not reached, get a dedicated connection
                 try:  # first try to get it from the idle cache
                     con = self._idle_cache.pop(0)
@@ -380,9 +401,9 @@ class PooledDB:
                 self._connections += 1
         return con
 
-    def dedicated_connection(self):
+    def dedicated_connection(self, timeout=None):
         """Alias for connection(shareable=False)."""
-        return self.connection(False)
+        return self.connection(False, timeout)
 
     def unshare(self, con):
         """Decrease the share of a connection in the shared cache."""
@@ -431,11 +452,36 @@ class PooledDB:
         except:  # noqa: E722, S110
             pass
 
-    def _wait_lock(self):
-        """Wait until notified or report an error."""
-        if not self._blocking:
-            raise TooManyConnectionsError
-        self._lock.wait()
+    @staticmethod
+    def _check_timeout(timeout):
+        """Validate the connection wait timeout."""
+        if timeout is not None:
+            if not isinstance(timeout, (int, float)):
+                raise TypeError("'timeout' must be a number or None")
+            if not math.isfinite(timeout) or timeout < 0:
+                raise ValueError("'timeout' must be a non-negative number "
+                                 "or None")
+        return timeout
+
+    def _wait_lock(self, timeout=None, deadline=None):
+        """Wait until notified or report an error.
+
+        Return the monotonic deadline for use by subsequent waits caused
+        by spurious wakeups.  The timeout does not include connection
+        creation or health checks performed after waiting succeeds.
+        """
+        if timeout is None:
+            if not self._blocking:
+                raise TooManyConnectionsError
+            self._lock.wait()
+            return None
+        if deadline is None:
+            deadline = monotonic() + timeout
+        remaining = deadline - monotonic()
+        if remaining > 0:
+            self._lock.wait(remaining)
+            return deadline
+        raise TooManyConnectionsError
 
 
 # Auxiliary classes for pooled connections
