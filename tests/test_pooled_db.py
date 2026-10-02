@@ -19,6 +19,7 @@ from dbutils.pooled_db import (
     InvalidConnectionError,
     NotSupportedError,
     PooledDB,
+    PooledDBClosedError,
     SharedDBConnection,
     TooManyConnectionsError,
 )
@@ -361,6 +362,110 @@ def test_close_all_shared(dbapi, threadsafety):
     assert len(pool._idle_cache) == 0
     if shareable:
         assert len(pool._shared_cache) == 0
+
+
+def test_shutdown_drains_shared_transaction(dbapi):
+    """Check draining waits for the last share of a transactional connection."""
+    pool = PooledDB(dbapi, 0, 0, 1)
+    db1 = pool.connection()
+    db2 = pool.connection()
+    assert db1._con is db2._con
+    con = db1._con
+    raw_con = con._con
+    db1.begin()
+
+    pool.shutdown()
+    with pytest.raises(PooledDBClosedError):
+        pool.connection()
+    assert pool.drain(timeout=0) is False
+    assert pool._connections == 1
+    assert pool._idle_cache == []
+
+    db2.close()
+    assert raw_con.valid
+    assert raw_con.session == []
+    assert pool.drain(timeout=0) is False
+    assert pool._connections == 1
+    assert pool._shared_cache[0].shared == 1
+
+    db1.commit()
+    assert raw_con.session == ['commit']
+    db1.close()
+    assert not raw_con.valid
+    assert pool._connections == 0
+    assert pool._shared_cache == []
+    assert pool.drain(timeout=0) is True
+    pool.shutdown()
+    assert pool.drain(timeout=0) is True
+
+
+def test_shutdown_rejects_new_and_wakes_waiting_thread(dbapi):
+    """Check shutdown wakes a thread waiting for a connection."""
+    pool = PooledDB(dbapi, 0, 0, 0, 1, True)
+    db = pool.connection(False)
+    errors = []
+
+    def connection():
+        try:
+            pool.connection()
+        except PooledDBClosedError as error:
+            errors.append(error)
+
+    thread = Thread(target=connection)
+    thread.start()
+    thread.join(0.1)
+    assert thread.is_alive()
+    pool.shutdown()
+    thread.join(0.1)
+    assert not thread.is_alive()
+    assert len(errors) == 1
+    with pytest.raises(PooledDBClosedError):
+        pool.connection(False)
+
+    raw_con = db._con._con
+    db.close()
+    assert not raw_con.valid
+    assert pool.drain(timeout=0) is True
+
+
+def test_shutdown_wakes_shared_transaction_waiter(dbapi):
+    """Check shutdown wakes a waiter blocked by a shared transaction."""
+    pool = PooledDB(dbapi, 0, 0, 1, 0, True)
+    db = pool.connection()
+    db.begin()
+    raw_con = db._con._con
+    errors = []
+
+    def connection():
+        try:
+            pool.connection()
+        except PooledDBClosedError as error:
+            errors.append(error)
+
+    thread = Thread(target=connection)
+    thread.start()
+    thread.join(0.1)
+    assert thread.is_alive()
+    pool.shutdown()
+    thread.join(0.1)
+    assert not thread.is_alive()
+    assert len(errors) == 1
+    assert raw_con.valid
+
+    db.commit()
+    db.close()
+    assert not raw_con.valid
+    assert pool.drain(timeout=0) is True
+    assert pool._waiting_connections == 0
+
+
+def test_drain_starts_shutdown_and_is_idempotent(dbapi):
+    """Check drain can enter the shutdown state itself."""
+    pool = PooledDB(dbapi, 0)
+    assert pool.drain(timeout=0) is True
+    with pytest.raises(PooledDBClosedError):
+        pool.connection()
+    assert pool.drain(timeout=0) is True
 
 
 @pytest.mark.parametrize("threadsafety", [1, 2])

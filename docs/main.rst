@@ -409,6 +409,15 @@ Instead of this, you can also get a dedicated connection as follows::
 If you don't need it anymore, you should immediately return it to the
 pool with ``db.close()``. You can get another connection in the same way.
 
+Use ``shutdown()`` when the service should stop handing out new connections.
+The method wakes threads that are currently waiting for a connection and
+keeps already checked-out connections usable until they are returned with
+``db.close()``.  Shared physical connections are only closed when their last
+proxy is returned.  Use ``drain(timeout)`` for a bounded wait; it returns
+whether all connections have been returned and closed.  The pool ``close()``
+method is not a graceful shutdown and keeps its legacy behavior of closing
+the currently cached connections.
+
 .. warning::
     In a threaded environment, never do the following::
 
