@@ -129,6 +129,15 @@ You can also use context managers for simpler code:
             cur.execute(...)
             res = cur.fetchone()
 
+If you find that a connection has become unusable, e.g. because the
+database server reported a fatal error for that connection, you can
+remove it from the pool with db.invalidate() instead of returning it
+with db.close().  This actually closes the underlying connection and
+frees its slot in the pool, so that the next request will transparently
+create a replacement connection.  If the connection was shared, all
+other proxies for the same underlying connection will also become
+invalid and report an InvalidConnectionError when they are used again.
+
 Note that you need to explicitly start transactions by calling the
 begin() method.  This ensures that the connection will not be shared
 with other threads, that the transparent reopening will be suspended
@@ -389,12 +398,32 @@ class PooledDB:
         with self._lock:
             con.unshare()
             shared = con.shared
-            if not shared:  # connection is idle
+            if not shared and not con.invalidated:  # connection is idle
                 # try to remove it from shared cache
                 with suppress(ValueError):  # if pool has already been closed
                     self._shared_cache.remove(con)
-        if not shared:  # connection has become idle,
+        if not shared and not con.invalidated:
+            # connection has become idle,
             self.cache(con.con)  # so add it to the idle cache
+
+    def invalidate(self, con):
+        """Invalidate a dedicated connection, removing it from the pool."""
+        with self._lock:
+            con._close()  # actually close the connection
+            self._connections -= 1
+            self._lock.notify()
+
+    def invalidate_shared(self, shared_con):
+        """Invalidate a shared connection, removing it from the pool."""
+        with self._lock:
+            shared_con.invalidated = True
+            shared_con.unshare()  # the invalidating proxy releases its share
+            # try to remove it from the shared cache
+            with suppress(ValueError):  # if pool has already been closed
+                self._shared_cache.remove(shared_con)
+            shared_con.con._close()  # actually close the connection
+            self._connections -= 1
+            self._lock.notify_all()
 
     def cache(self, con):
         """Put a dedicated connection back into the idle cache."""
@@ -465,6 +494,14 @@ class PooledDedicatedDBConnection:
             self._pool.cache(self._con)
             self._con = None
 
+    def invalidate(self):
+        """Invalidate the pooled dedicated connection."""
+        # Instead of returning the connection to the pool,
+        # actually close it and remove it from the pool.
+        if self._con:
+            self._pool.invalidate(self._con)
+            self._con = None
+
     def __getattr__(self, name):
         """Proxy all members of the class."""
         if self._con:
@@ -499,6 +536,7 @@ class SharedDBConnection:
         """
         self.con = con
         self.shared = 1
+        self.invalidated = False
 
     def __lt__(self, other):
         """Check whether this connection should come before the other one."""
@@ -556,9 +594,18 @@ class PooledSharedDBConnection:
             self._pool.unshare(self._shared_con)
             self._shared_con = self._con = None
 
+    def invalidate(self):
+        """Invalidate the pooled shared connection."""
+        # Instead of unsharing the connection and returning it
+        # to the pool, actually close it and remove it from the pool.
+        # Other proxies sharing the same connection will become invalid.
+        if self._con:
+            self._pool.invalidate_shared(self._shared_con)
+            self._shared_con = self._con = None
+
     def __getattr__(self, name):
         """Proxy all members of the class."""
-        if self._con:
+        if self._con and not self._shared_con.invalidated:
             return getattr(self._con, name)
         raise InvalidConnectionError
 

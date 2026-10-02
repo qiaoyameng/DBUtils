@@ -1,6 +1,20 @@
 Changelog for DBUtils
 +++++++++++++++++++++
 
+3.3.0
+=====
+
+DBUtils 3.3.0 has not yet been released.
+
+Changes:
+
+* Added an ``invalidate()`` method to the connections provided by
+  ``PooledDB`` that actually closes the underlying connection and removes
+  it from the pool, instead of returning it to the pool like ``close()``.
+  Other proxies sharing the same connection become invalid as well and
+  report an ``InvalidConnectionError`` when they are used again, while a
+  replacement connection is transparently created on the next request.
+
 3.2.0
 =====
 

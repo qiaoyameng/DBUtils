@@ -320,6 +320,159 @@ def test_close_connection(dbapi, threadsafety):
         assert len(pool._shared_cache) == 0
 
 
+def _counting_close(dbapi, monkeypatch):
+    """Count the underlying connections that are actually closed."""
+    closed = []
+    close = dbapi.Connection.close
+
+    def counting_close(self):
+        closed.append(self)
+        close(self)
+
+    monkeypatch.setattr(dbapi.Connection, 'close', counting_close)
+    return closed
+
+
+def test_invalidate_dedicated_connection(dbapi, monkeypatch):
+    """Check that a dedicated connection can be invalidated."""
+    pool = PooledDB(dbapi, 1, 1, 1)
+    closed = _counting_close(dbapi, monkeypatch)
+    db = pool.connection(False)
+    db_con = db._con._con
+    assert pool._connections == 1
+    # invalidating actually closes the underlying connection
+    # and frees its slot in the pool
+    db.invalidate()
+    assert db._con is None
+    assert closed == [db_con]
+    assert not db_con.valid
+    assert pool._connections == 0
+    assert len(pool._idle_cache) == 0
+    # the invalidated proxy reports an error when used again
+    with pytest.raises(InvalidConnectionError):
+        db.cursor()
+    # closing after invalidation is a no-op and does not close
+    # the connection again or decrease the connection count
+    db.close()
+    assert closed == [db_con]
+    assert pool._connections == 0
+    assert len(pool._idle_cache) == 0
+    # invalidating a second time is a no-op as well
+    db.invalidate()
+    assert closed == [db_con]
+    assert pool._connections == 0
+    # a new connection is created as a replacement,
+    # occupying exactly one new slot in the pool
+    db = pool.connection(False)
+    assert pool._connections == 1
+    new_db_con = db._con._con
+    assert new_db_con is not db_con
+    assert new_db_con.valid
+    db.cursor().execute('select test')
+    db.close()
+    assert closed == [db_con]
+    assert pool._connections == 0
+    assert len(pool._idle_cache) == 1
+
+
+def test_invalidate_shared_connection(dbapi, monkeypatch):
+    """Check that a shared connection can be invalidated."""
+    pool = PooledDB(dbapi, 0, 0, 1)
+    closed = _counting_close(dbapi, monkeypatch)
+    # get two proxies sharing the same underlying connection
+    # and one proxy for a dedicated connection
+    db1 = pool.connection()
+    db2 = pool.connection()
+    db3 = pool.connection(False)
+    assert db1._con is db2._con
+    shared_con = db1._shared_con
+    assert shared_con.shared == 2
+    shared_db_con = db1._con._con
+    dedicated_db_con = db3._con._con
+    # the two shared proxies count as one physical connection
+    assert pool._connections == 2
+    # invalidating one shared proxy actually closes the underlying
+    # connection and frees its slot in the pool
+    db1.invalidate()
+    assert db1._con is None
+    assert db1._shared_con is None
+    assert shared_con.invalidated
+    assert closed == [shared_db_con]
+    assert not shared_db_con.valid
+    assert dedicated_db_con.valid
+    assert pool._connections == 1
+    assert len(pool._shared_cache) == 0
+    # both proxies of the invalidated connection report errors,
+    # while the dedicated connection is not affected
+    for db in db1, db2:
+        with pytest.raises(InvalidConnectionError):
+            db.cursor()
+    cursor = db3.cursor()
+    cursor.execute('select test')
+    assert cursor.fetchone() == 'test'
+    # returning the invalidated proxies does not put the connection
+    # back into the pool and does not decrease the connection count
+    db1.close()
+    db2.close()
+    assert shared_con.shared == 0
+    assert closed == [shared_db_con]
+    assert pool._connections == 1
+    assert len(pool._idle_cache) == 0
+    # a new connection is created as a replacement,
+    # occupying exactly one new slot in the pool
+    db4 = pool.connection()
+    assert pool._connections == 2
+    replacement_db_con = db4._con._con
+    assert replacement_db_con is not shared_db_con
+    assert replacement_db_con is not dedicated_db_con
+    assert replacement_db_con.valid
+    cursor = db4.cursor()
+    cursor.execute('select test')
+    assert cursor.fetchone() == 'test'
+    # returning the other connections puts them back into the pool
+    db3.close()
+    db4.close()
+    assert closed == [shared_db_con]
+    assert pool._connections == 0
+    assert len(pool._idle_cache) == 2
+
+
+def test_invalidate_shared_connection_in_transaction(dbapi, monkeypatch):
+    """Check invalidating a shared connection that is in a transaction."""
+    pool = PooledDB(dbapi, 0, 0, 1)
+    closed = _counting_close(dbapi, monkeypatch)
+    db1 = pool.connection()
+    db2 = pool.connection()
+    shared_db_con = db1._con._con
+    db1.begin()
+    db1.cursor().execute('select test')
+    assert pool._connections == 1
+    # invalidating the connection in a transaction closes it
+    db2.invalidate()
+    assert closed == [shared_db_con]
+    assert pool._connections == 0
+    # the transaction is not silently replayed on a new connection,
+    # both proxies report the connection as invalid instead
+    for db in db1, db2:
+        with pytest.raises(InvalidConnectionError):
+            db.cursor()
+        with pytest.raises(InvalidConnectionError):
+            db.rollback()
+    db1.close()
+    db2.close()
+    assert closed == [shared_db_con]
+    assert pool._connections == 0
+    assert len(pool._idle_cache) == 0
+    # a replacement connection can be created normally
+    db3 = pool.connection()
+    assert pool._connections == 1
+    assert db3._con._con is not shared_db_con
+    db3.cursor().execute('select test')
+    db3.close()
+    assert closed == [shared_db_con]
+    assert pool._connections == 0
+
+
 def test_close_all(dbapi):
     """Check that closing the pool empties the idle cache."""
     pool = PooledDB(dbapi, 10)
