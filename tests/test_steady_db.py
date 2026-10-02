@@ -1617,3 +1617,321 @@ def test_invalid_cursor():
         cursor.fetchone  # noqa: B018
     with pytest.raises(InvalidCursorError):
         cursor.execute  # noqa: B018
+
+
+class FlakyModule:
+    """Mock DB-API 2 module simulating ambiguous connection failures.
+
+    The driver can simulate a connection that is lost either before an
+    operation reaches the server or after a write has already been
+    applied, and it counts how often operations physically reached
+    the server, even though the failover opens new connections.
+    """
+
+    threadsafety = 2
+    OperationalError = dbapi.OperationalError
+    InterfaceError = dbapi.InterfaceError
+    InternalError = dbapi.InternalError
+
+    def __init__(self):
+        """Create the mock module with empty logs and no drops."""
+        self.writes = []  # write operations that physically reached the server
+        self.errors = []  # the connection errors raised by the driver
+        self.selects = 0  # select statements that physically reached the server
+        self.drop_mode = 'after'  # 'before' or 'after' the write operation
+        self.drops = 0  # number of connection drops still to be simulated
+
+    def connect(self):
+        """Create a mocked connection."""
+        return FlakyConnection(self)
+
+
+class FlakyConnection:
+    """Mock DB-API 2 connection that can be dropped on demand."""
+
+    def __init__(self, module):
+        """Create a mocked connection bound to the mock module."""
+        self.module = module
+        self.valid = True
+
+    def close(self):
+        """Close the mocked connection."""
+        self.valid = False
+
+    def commit(self):
+        """Commit, unless the connection has been dropped."""
+        if not self.valid:
+            raise dbapi.InternalError
+
+    def rollback(self):
+        """Roll back, unless the connection has been dropped."""
+        if not self.valid:
+            raise dbapi.InternalError
+
+    def cursor(self):
+        """Create a cursor, unless the connection has been dropped."""
+        if not self.valid:
+            raise dbapi.InternalError
+        return FlakyCursor(self)
+
+
+class FlakyCursor:
+    """Mock DB-API 2 cursor counting the physical executions."""
+
+    def __init__(self, con):
+        """Create a mocked cursor bound to a mocked connection."""
+        self.con = con
+        self.valid = True
+        self.result = None
+        self.inputsizes = []
+        self.outputsizes = {}
+
+    def close(self):
+        """Close the mocked cursor."""
+        self.valid = False
+
+    def _maybe_drop(self):
+        """Simulate a lost connection if drops are still pending."""
+        module = self.con.module
+        if module.drops:
+            module.drops -= 1
+            self.con.valid = False
+            error = dbapi.OperationalError('connection lost')
+            module.errors.append(error)
+            raise error
+
+    def _write(self, operation, params=None):
+        """Physically apply a write operation on the server."""
+        module = self.con.module
+        if module.drop_mode == 'before':
+            self._maybe_drop()  # lost before anything was applied
+        module.writes.append((operation, params))
+        if module.drop_mode == 'after':
+            self._maybe_drop()  # lost after the write had been applied
+
+    def execute(self, operation, params=None):
+        """Execute an operation, unless the connection has been dropped."""
+        if not self.valid or not self.con.valid:
+            raise dbapi.InternalError
+        module = self.con.module
+        if operation.startswith('insert'):
+            self._write(operation, params)
+        else:
+            module.selects += 1
+            self.result = operation
+
+    def executemany(self, operation, seq_of_params):
+        """Execute an operation for all parameter sets."""
+        if not self.valid or not self.con.valid:
+            raise dbapi.InternalError
+        for params in seq_of_params:
+            self._write(operation, params)
+
+    def fetchone(self):
+        """Fetch the pending result."""
+        result = self.result
+        self.result = None
+        return result
+
+    def setinputsizes(self, sizes):
+        """Store the input sizes."""
+        self.inputsizes = sizes
+
+    def setoutputsize(self, size, column=None):
+        """Store the output sizes."""
+        self.outputsizes[column] = size
+
+
+def never_replay(operation, transaction, phase, error):  # noqa: ARG001
+    """Conservative policy: never replay a failed operation."""
+    return False
+
+
+def test_connection_replayable_must_be_callable():
+    """Check that replayable must be a callable when it is given."""
+    steady_db_connect(dbapi, replayable=None)
+    steady_db_connect(dbapi, replayable=never_replay)
+    with pytest.raises(TypeError):
+        steady_db_connect(dbapi, replayable='never')
+    with pytest.raises(TypeError):
+        steady_db_connect(dbapi, replayable=42)
+
+
+def test_replayable_default_replays_ambiguous_write():
+    """By default, a write that failed after being applied is replayed."""
+    module = FlakyModule()
+    module.drops = 1
+    db = steady_db_connect(module)
+    cursor = db.cursor()
+    cursor.execute('insert into t values (1)')
+    # the write physically reached the server twice, because the default
+    # failover mechanism replays the operation on the new connection
+    assert module.writes == [
+        ('insert into t values (1)', None), ('insert into t values (1)', None)]
+
+
+def test_replayable_disconnect_before_execute():
+    """A connection lost before executing can be safely replayed."""
+    module = FlakyModule()
+    module.drop_mode = 'before'
+    module.drops = 1
+    db = steady_db_connect(module)
+    cursor = db.cursor()
+    cursor.execute('insert into t values (1)')
+    # nothing was applied before the connection dropped,
+    # so the replay applied the write exactly once
+    assert module.writes == [('insert into t values (1)', None)]
+
+
+def test_replayable_is_asked_with_context():
+    """Check that the policy gets operation, transaction, phase and error."""
+    module = FlakyModule()
+    module.drops = 2  # let the first replay attempt fail as well
+    calls = []
+
+    def record_and_allow(operation, transaction, phase, error):
+        calls.append((operation, transaction, phase, error))
+        return True
+
+    db = steady_db_connect(module, replayable=record_and_allow)
+    cursor = db.cursor()
+    cursor.execute('insert into t values (1)')
+    # the write was physically applied three times: directly, with a new
+    # cursor, and on a new connection, before it finally succeeded
+    assert len(module.writes) == 3
+    # the policy has been asked in both recovery phases,
+    # always with the original exception raised by the driver
+    assert [(call[0], call[1], call[2]) for call in calls] == [
+        ('execute', False, 'cursor'), ('execute', False, 'connection')]
+    assert len(module.errors) == 2
+    assert calls[0][3] is module.errors[0]
+    assert calls[1][3] is module.errors[0]
+
+
+def test_replayable_refuses_uncertain_write():
+    """A conservative policy protects the current operation from replay."""
+    module = FlakyModule()
+    module.drops = 1
+    db = steady_db_connect(module, replayable=never_replay)
+    cursor = db.cursor()
+    con = db._con
+    with pytest.raises(dbapi.OperationalError) as excinfo:
+        cursor.execute('insert into t values (1)')
+    # the write physically reached the server only once,
+    # and the very exception raised by the driver is re-raised,
+    # not just an exception with the same name
+    assert module.writes == [('insert into t values (1)', None)]
+    assert len(module.errors) == 1
+    assert excinfo.value is module.errors[0]
+    # refusing the replay does not prevent the connection from
+    # being restored for subsequent calls
+    assert db._con is not con
+    assert db._con.valid
+    cursor.execute('select ok')
+    assert cursor.fetchone() == 'select ok'
+    assert module.selects == 1
+
+
+def test_replayable_not_asked_in_transaction():
+    """Inside a transaction, operations are never replayed anyway."""
+    module = FlakyModule()
+    module.drops = 1
+    calls = []
+
+    def record_and_allow(operation, transaction, phase, error):
+        calls.append((operation, transaction, phase, error))
+        return True
+
+    db = steady_db_connect(module, replayable=record_and_allow)
+    cursor = db.cursor()
+    con = db._con
+    db.begin()
+    with pytest.raises(dbapi.OperationalError) as excinfo:
+        cursor.execute('insert into t values (1)')
+    # no replay happened and the policy has not been consulted
+    assert module.writes == [('insert into t values (1)', None)]
+    assert calls == []
+    assert excinfo.value is module.errors[0]
+    # the connection has still been restored for subsequent calls
+    assert db._con is not con
+    cursor.execute('select ok')
+    assert cursor.fetchone() == 'select ok'
+
+
+def test_executemany_replays_full_parameters():
+    """A one-time parameter iterator must be replayed with all parameters."""
+    module = FlakyModule()
+    module.drops = 1
+    db = steady_db_connect(module)
+    cursor = db.cursor()
+    cursor.executemany(
+        'insert into t values (%s)', ((i,) for i in range(3)))
+    # the first attempt applied the first row and then dropped the
+    # connection; the replay must have used the full parameter list,
+    # not the half-consumed iterator with only the remaining two rows
+    operation = 'insert into t values (%s)'
+    assert module.writes == [
+        (operation, (0,)), (operation, (0,)),
+        (operation, (1,)), (operation, (2,))]
+
+
+def test_executemany_refused_replay_keeps_partial_result():
+    """A refused executemany replay must not hide the partial execution."""
+    module = FlakyModule()
+    module.drops = 1
+    db = steady_db_connect(module, replayable=never_replay)
+    cursor = db.cursor()
+    with pytest.raises(dbapi.OperationalError) as excinfo:
+        cursor.executemany(
+            'insert into t values (%s)', ((i,) for i in range(3)))
+    # only the physically applied row reached the server,
+    # and the original exception is re-raised to the application
+    operation = 'insert into t values (%s)'
+    assert module.writes == [(operation, (0,))]
+    assert excinfo.value is module.errors[0]
+    # the connection has been restored for subsequent calls
+    cursor.execute('select ok')
+    assert cursor.fetchone() == 'select ok'
+
+
+def test_replayable_sizes_stay_consistent():
+    """Check that cursor sizes are replayed and cleared consistently."""
+    module = FlakyModule()
+    module.drops = 1
+    db = steady_db_connect(module)
+    cursor = db.cursor()
+    cursor.setinputsizes([7, 42])
+    cursor.setoutputsize(9)
+    cursor.execute('insert into t values (1)')
+    # the sizes have been replayed on the new cursor
+    assert cursor._cursor.inputsizes == [7, 42]
+    assert cursor._cursor.outputsizes == {None: 9}
+    # and they have been cleared after the successful execution
+    assert cursor._inputsizes == []
+    assert cursor._outputsizes == {}
+    # when the replay is refused, the sizes stay pending,
+    # because the operation did not complete successfully
+    module.drops = 1
+    db = steady_db_connect(module, replayable=never_replay)
+    cursor = db.cursor()
+    cursor.setinputsizes([7, 42])
+    cursor.setoutputsize(9)
+    with pytest.raises(dbapi.OperationalError):
+        cursor.execute('insert into t values (1)')
+    assert cursor._inputsizes == [7, 42]
+    assert cursor._outputsizes == {None: 9}
+    # the cursor on the restored connection got no sizes applied
+    assert cursor._cursor.inputsizes == []
+    assert cursor._cursor.outputsizes == {}
+
+
+def test_connection_replayable_ignored_when_overused():
+    """The reset triggered by maxusage must not be vetoed."""
+    db = steady_db_connect(dbapi, 3, replayable=never_replay)
+    cursor = db.cursor()
+    for i in range(10):
+        cursor.execute(f'select test{i}')
+        assert cursor.fetchone() == f'test{i}'
+        assert db._con.valid
+        assert db._usage == i % 3 + 1
+        assert db._con.num_uses == i % 3 + 1

@@ -1,6 +1,28 @@
 Changelog for DBUtils
 +++++++++++++++++++++
 
+3.3.0
+=====
+
+DBUtils 3.3.0 has not been released yet.
+
+Changes:
+
+* Added a ``replayable`` parameter to ``PersistentDB``, ``PooledDB`` and
+  ``steady_db.connect()``, an optional callable that is passed the name of
+  a failed cursor operation, whether the connection is in an explicit
+  transaction, the recovery phase and the original exception, and decides
+  whether the failed operation may be replayed by the failover mechanism.
+  This allows refusing to replay operations whose effect is uncertain,
+  e.g. when a driver reports a broken connection after a write has already
+  been applied.  When the replay is refused, the connection is still
+  restored for subsequent calls, and the original error is raised.
+* Parameter sequences passed to ``executemany()`` as one-time iterators
+  are now consumed into a list before the first execution, so that a
+  replay of a failed ``executemany()`` always runs with the complete
+  parameters instead of only the remaining ones of a half-consumed
+  iterator.
+
 3.2.0
 =====
 

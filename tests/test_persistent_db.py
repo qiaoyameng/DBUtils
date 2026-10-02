@@ -379,6 +379,32 @@ def test_isfatal(dbapi):
     assert cursor.fetchone() == 'test'
 
 
+def never_replay(operation, transaction, phase, error):  # noqa: ARG001
+    """Conservative policy: never replay a failed operation."""
+    return False
+
+
+def test_replayable_default(dbapi):
+    """Check that no replay policy is configured by default."""
+    persist = PersistentDB(dbapi)
+    assert persist._replayable is None
+    db = persist.connection()
+    assert db._replayable is None
+
+
+def test_replayable(dbapi):
+    """Check that replayable is passed on and can veto the replay."""
+    persist = PersistentDB(dbapi, replayable=never_replay)
+    assert persist._replayable is never_replay
+    db = persist.connection()
+    assert db._replayable is never_replay
+    dbapi.Connection.num_timeouts = 0
+    cursor = db.cursor()
+    with pytest.raises(dbapi.OperationalError):
+        cursor.execute('timeout')
+    assert dbapi.Connection.num_timeouts == 1
+
+
 def test_no_failover(dbapi):
     """Check that no_failover() suspends the failover mechanism."""
     persist = PersistentDB(dbapi)

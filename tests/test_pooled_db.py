@@ -1627,6 +1627,32 @@ def test_isfatal(dbapi):
     assert cursor.fetchone() == 'test'
 
 
+def never_replay(operation, transaction, phase, error):  # noqa: ARG001
+    """Conservative policy: never replay a failed operation."""
+    return False
+
+
+def test_replayable_default(dbapi):
+    """Check that no replay policy is configured by default."""
+    pool = PooledDB(dbapi, 1)
+    assert pool._replayable is None
+    db = pool.connection()
+    assert db._con._replayable is None
+
+
+def test_replayable(dbapi):
+    """Check that replayable is passed on and can veto the replay."""
+    pool = PooledDB(dbapi, 1, replayable=never_replay)
+    assert pool._replayable is never_replay
+    db = pool.connection()
+    assert db._con._replayable is never_replay
+    dbapi.Connection.num_timeouts = 0
+    cursor = db.cursor()
+    with pytest.raises(dbapi.OperationalError):
+        cursor.execute('timeout')
+    assert dbapi.Connection.num_timeouts == 1
+
+
 def test_no_failover(dbapi):
     """Check that no_failover() suspends the failover mechanism."""
     pool = PooledDB(dbapi, 1)

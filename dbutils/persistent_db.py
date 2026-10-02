@@ -47,6 +47,9 @@ by creating an instance of PersistentDB, passing the following parameters:
     isfatal: an optional callable deciding whether a given exception is
         really fatal for the connection and the failover mechanism shall
         be applied (see the steady_db module for details)
+    replayable: an optional callable deciding whether a failed cursor
+        operation may be replayed by the failover mechanism
+        (see the steady_db module for details)
     ping: an optional flag controlling when connections are checked
         (0 = None = never, 1 = default = whenever it is requested,
         2 = when a cursor is created, 4 = when a query is executed,
@@ -154,7 +157,7 @@ class PersistentDB:
             self, creator,
             maxusage=None, setsession=None, failures=None, ping=1,
             closeable=False, threadlocal=None, isfatal=None,
-            *args, **kwargs):
+            *args, replayable=None, **kwargs):
         """Set up the persistent DB-API 2 connection generator.
 
         creator: either an arbitrary function returning new DB-API 2
@@ -177,6 +180,15 @@ class PersistentDB:
             database module maps both onto the same exception class.  The
             callable must tolerate arbitrary exception instances, including
             instances without args.
+        replayable: an optional callable that is passed the name of a failed
+            cursor operation, whether the connection is in an explicit
+            transaction, the recovery phase and the original exception, and
+            shall return whether the failed operation may be replayed
+            (must be passed as a keyword argument).
+            Use this to refuse replaying operations whose effect is
+            uncertain, e.g. when a driver reports a broken connection
+            after a write has already been applied.  By default (None),
+            every failed operation is replayed, as it has always been.
         ping: determines when the connection should be checked
             (0 = None = never, 1 = default = whenever it is requested,
             2 = when a cursor is created, 4 = when a query is executed,
@@ -219,6 +231,7 @@ class PersistentDB:
         self._setsession = setsession
         self._failures = failures
         self._isfatal = isfatal
+        self._replayable = replayable
         self._ping = ping
         self._closeable = closeable
         self._args, self._kwargs = args, kwargs
@@ -229,7 +242,8 @@ class PersistentDB:
         return connect(
             self._creator, self._maxusage, self._setsession,
             self._failures, self._ping, self._closeable,
-            self._isfatal, *self._args, **self._kwargs)
+            self._isfatal, *self._args, replayable=self._replayable,
+            **self._kwargs)
 
     def connection(self, shareable=False):  # noqa: ARG002
         """Get a steady, persistent DB-API 2 connection.

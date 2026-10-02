@@ -134,7 +134,7 @@ def _sql_pinger(sql):
 def connect(
         creator, maxusage=None, setsession=None,
         failures=None, ping=1, closeable=True, isfatal=None,
-        *args, **kwargs):
+        *args, replayable=None, **kwargs):
     """Create a "tough" connection.
 
     A hardened version of the connection function of a DB-API 2 module.
@@ -162,6 +162,21 @@ def connect(
         when the database module maps both onto the same exception class.
         The callable must tolerate arbitrary exception instances of the
         classes given as failures, including instances without args.
+    replayable: an optional callable that is passed the name of the failed
+        cursor operation, whether the connection is in an explicit
+        transaction, the phase in which the failure shall be recovered
+        ('cursor' when the operation would be replayed with a new cursor
+        on the same connection, 'connection' when it would be replayed
+        on a newly opened connection) and the original exception, and
+        shall return whether the failed operation may be replayed
+        (must be passed as a keyword argument).
+        This allows refusing to replay operations whose effect is
+        uncertain, e.g. when a driver reports a broken connection after
+        a write has already been applied.  When the callable returns a
+        false value, the operation is not executed again, but the
+        connection is still restored for subsequent calls, and the
+        original error is raised to the application.  By default (None),
+        every failed operation is replayed, as it has always been.
     ping: determines when and how the connection shall be checked
         (0 = None = never, 1 = default = when _ping_check() is called,
         2 = whenever a cursor is created, 4 = when a query is executed,
@@ -184,7 +199,8 @@ def connect(
     """
     return SteadyDBConnection(
         creator, maxusage, setsession,
-        failures, ping, closeable, isfatal, *args, **kwargs)
+        failures, ping, closeable, isfatal, *args, replayable=replayable,
+        **kwargs)
 
 
 class SteadyDBConnection:
@@ -195,7 +211,7 @@ class SteadyDBConnection:
     def __init__(
             self, creator, maxusage=None, setsession=None,
             failures=None, ping=1, closeable=True, isfatal=None,
-            *args, **kwargs):
+            *args, replayable=None, **kwargs):
         """Create a "tough" DB-API 2 connection."""
         # basic initialization to make finalizer work
         self._con = None
@@ -242,6 +258,9 @@ class SteadyDBConnection:
         if isfatal is not None and not callable(isfatal):
             raise TypeError("'isfatal' must be a callable.")
         self._isfatal = isfatal
+        if replayable is not None and not callable(replayable):
+            raise TypeError("'replayable' must be a callable.")
+        self._replayable = replayable
         self._ping, self._pinger = self._parse_ping(ping)
         self._closeable = closeable
         self._args, self._kwargs = args, kwargs
@@ -471,6 +490,12 @@ class SteadyDBConnection:
     def _fatal_check(self, error):
         """Check whether the error is fatal for the connection."""
         return self._isfatal is None or self._isfatal(error)
+
+    def _replay_check(self, operation, transaction, phase, error):
+        """Check whether a failed operation may be replayed."""
+        if self._replayable is None:
+            return True
+        return bool(self._replayable(operation, transaction, phase, error))
 
     def threadsafety(self):
         """Return the thread safety level of the connection."""
@@ -729,6 +754,12 @@ class SteadyDBCursor:
         """Return a "tough" version of the given cursor method."""
         def tough_method(*args, **kwargs):
             execute = name.startswith('execute')
+            if name == 'executemany' and len(args) > 1:
+                # snapshot one-time parameter iterators, so that a replay
+                # does not silently run with partially consumed parameters
+                params = args[1]
+                if not isinstance(params, (list, tuple)):
+                    args = (args[0], list(params)) + args[2:]
             con = self._con
             transaction = con._transaction
             if not transaction:
@@ -752,7 +783,8 @@ class SteadyDBCursor:
                 if not overused and (
                         self._no_failover or not con._fatal_check(error)):
                     raise
-                if not transaction:
+                if not transaction and (overused or con._replay_check(
+                        name, transaction, 'cursor', error)):
                     try:
                         cursor2 = con._cursor(
                             *self._args, **self._kwargs)  # open new cursor
@@ -786,7 +818,12 @@ class SteadyDBCursor:
                     except Exception:  # noqa: S110
                         pass
                     else:
-                        if transaction:
+                        if transaction or (not overused
+                                and not con._replay_check(
+                                    name, transaction, 'connection', error)):
+                            # the operation cannot or must not be replayed,
+                            # but the connection is restored for subsequent
+                            # calls, and the original error is raised
                             self.close()
                             con._close()
                             con._store(con2)

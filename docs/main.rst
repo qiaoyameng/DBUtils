@@ -256,6 +256,12 @@ of ``PersistentDB``, passing the following parameters:
   shall be applied (must be passed as a keyword argument, see
   `Controlling the failover mechanism`_)
 
+* ``replayable``: an optional callable that is passed the name of a failed
+  cursor operation, whether the connection is in an explicit transaction,
+  the recovery phase and the original exception, and shall return whether
+  the failed operation may be replayed (must be passed as a keyword
+  argument, see `Controlling the failover mechanism`_)
+
 * ``ping``: an optional flag controlling when connections are checked
   (``0`` = ``None`` = never, ``1`` = default = whenever it is requested,
   ``2`` = when a cursor is created, ``4`` = when a query is executed,
@@ -363,6 +369,12 @@ following parameters:
   has been raised and shall return whether the connection failover mechanism
   shall be applied (must be passed as a keyword argument, see
   `Controlling the failover mechanism`_)
+
+* ``replayable``: an optional callable that is passed the name of a failed
+  cursor operation, whether the connection is in an explicit transaction,
+  the recovery phase and the original exception, and shall return whether
+  the failed operation may be replayed (must be passed as a keyword
+  argument, see `Controlling the failover mechanism`_)
 
 * ``ping``: an optional flag controlling when connections are checked
   (``0`` = ``None`` = never, ``1`` = default = whenever fetched from the pool,
@@ -514,6 +526,31 @@ statement instead of configuring it for the whole pool, you can use the
 
 Everything else, particularly the ping check and the usage bookkeeping of the
 underlying steady connection, is left untouched inside that context.
+
+There is yet another problem with automatically retrying failed operations:
+some database drivers report a broken connection only *after* a write
+operation has already been applied on the server. Replaying such an
+operation would apply the write a second time. If your application knows
+better which operations are safe to replay, you can pass a ``replayable``
+callable that is asked before every replay attempt::
+
+    def replayable(operation, transaction, phase, error):
+        # never replay a failed operation whose effect is uncertain
+        return operation not in ('execute', 'executemany')
+
+    pool = PooledDB(pymysql, 5, database='mydb', replayable=replayable)
+
+The callable is passed the name of the failed cursor operation, whether the
+connection is currently inside an explicit transaction, the recovery phase
+(``'cursor'`` when the operation would be replayed with a new cursor on the
+same connection, ``'connection'`` when it would be replayed on a newly
+opened connection) and the original exception. When it returns a false
+value, the operation is not executed again, but the connection is still
+restored for subsequent calls, and the original error is raised to the
+application. Note that ``replayable`` must be passed as a keyword argument,
+and that parameter sequences passed to ``executemany()`` as one-time
+iterators are always consumed into a list first, so that a replay never
+runs with only the remaining parameters of a half-consumed iterator.
 
 As a last resort, you can also reach through to the underlying DB-API 2
 objects with the ``dbapi_connection`` attribute of a connection and the

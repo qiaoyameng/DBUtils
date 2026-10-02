@@ -62,6 +62,9 @@ an instance of PooledDB, passing the following parameters:
     isfatal: an optional callable deciding whether a given exception is
         really fatal for the connection and the failover mechanism shall
         be applied (see the steady_db module for details)
+    replayable: an optional callable deciding whether a failed cursor
+        operation may be replayed by the failover mechanism
+        (see the steady_db module for details)
     ping: an optional flag controlling when connections are checked
         (0 = None = never, 1 = default = whenever fetched from the pool,
         2 = when a cursor is created, 4 = when a query is executed,
@@ -203,7 +206,7 @@ class PooledDB:
             maxshared=0, maxconnections=0, blocking=False,
             maxusage=None, setsession=None, reset=True,
             failures=None, ping=1, isfatal=None,
-            *args, **kwargs):
+            *args, replayable=None, **kwargs):
         """Set up the DB-API 2 connection pool.
 
         creator: either an arbitrary function returning new DB-API 2
@@ -243,6 +246,15 @@ class PooledDB:
             database module maps both onto the same exception class.  The
             callable must tolerate arbitrary exception instances, including
             instances without args.
+        replayable: an optional callable that is passed the name of a failed
+            cursor operation, whether the connection is in an explicit
+            transaction, the recovery phase and the original exception, and
+            shall return whether the failed operation may be replayed
+            (must be passed as a keyword argument).
+            Use this to refuse replaying operations whose effect is
+            uncertain, e.g. when a driver reports a broken connection
+            after a write has already been applied.  By default (None),
+            every failed operation is replayed, as it has always been.
         ping: determines when the connection should be checked
             (0 = None = never, 1 = default = whenever fetched from the pool,
             2 = when a cursor is created, 4 = when a query is executed,
@@ -283,6 +295,7 @@ class PooledDB:
         self._reset = reset
         self._failures = failures
         self._isfatal = isfatal
+        self._replayable = replayable
         self._ping = ping
         if mincached is None:
             mincached = 0
@@ -319,7 +332,7 @@ class PooledDB:
         return connect(
             self._creator, self._maxusage, self._setsession,
             self._failures, self._ping, True, self._isfatal,
-            *self._args, **self._kwargs)
+            *self._args, replayable=self._replayable, **self._kwargs)
 
     def connection(self, shareable=True):
         """Get a steady, cached DB-API 2 connection from the pool.
