@@ -1,6 +1,22 @@
 Changelog for DBUtils
 +++++++++++++++++++++
 
+Unreleased
+==========
+
+Changes:
+
+* The ``connection()`` and ``dedicated_connection()`` methods of
+  ``PooledDB`` now accept a ``timeout`` parameter that limits the time
+  spent waiting for a connection when the pool is full and ``blocking``
+  is set to true; a numeric timeout also applies to pools created with
+  ``blocking`` set to false.  The budget is measured with a monotonic
+  clock and applies to both shared and dedicated connections; spurious
+  wakeups do not reset it.  A value of ``0`` makes one immediate attempt,
+  and the default ``None`` keeps the previous behavior determined by the
+  ``blocking`` setting.  The timeout does not cover creating new
+  connections or the health checks of reused connections.
+
 3.2.0
 =====
 

@@ -340,6 +340,8 @@ following parameters:
 
   If this is set to true, block and wait until the number of
   connections decreases, but by default an error will be reported.
+  You can also limit the waiting time for an individual connection
+  request by passing a ``timeout`` parameter to ``connection()``.
 
 * ``maxusage``: maximum number of reuses of a single connection
   (the default of ``0`` or ``None`` means unlimited reuse)
@@ -395,6 +397,29 @@ from that pool::
 You can use these connections just as if they were ordinary DB-API 2
 connections. Actually what you get is the hardened ``steady_db`` version of
 the underlying DB-API 2 connection.
+
+If the pool was created with ``blocking=True`` and the maximum number of
+connections is reached, the request waits until a connection is returned.
+You can limit this waiting time with the ``timeout`` parameter, which takes
+a number of seconds::
+
+  db = pool.connection(timeout=0.2)
+
+A value of ``0`` makes only one immediate attempt without waiting, and the
+default value ``None`` keeps the behavior determined by the pool's
+``blocking`` setting (wait without a time limit for blocking pools, report
+an error immediately otherwise). A numeric timeout applies even when the
+pool itself was created without ``blocking``. The budget is measured
+with a monotonic clock, starts when the waiting for an available connection
+begins and is not reset by spurious wakeups; it applies to both shared and
+dedicated connections. Note that the timeout covers only the waiting for an
+available connection, but neither the creation of a new connection nor the
+health check (ping) of a connection that is reused from the pool. If no
+connection becomes available within the budget, a ``TooManyConnectionsError``
+is raised without having created a connection or changed the pool state.
+Invalid values (booleans, non-numeric, negative, NaN or infinite values)
+are rejected with a ``TypeError`` or ``ValueError`` before the pool is
+touched.
 
 Please note that the connection may be shared with other threads by default
 if you set a non-zero ``maxshared`` parameter and the DB-API 2 module allows

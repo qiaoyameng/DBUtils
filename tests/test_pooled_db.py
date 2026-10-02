@@ -10,10 +10,13 @@ Copyright and credit info:
 * This test was contributed by Christoph Zwerschke
 """
 
+from math import nan
 from queue import Empty, Queue
-from threading import Thread
+from threading import Barrier, Thread
 
 import pytest
+
+import dbutils.pooled_db as pooled_db_module
 
 from dbutils.pooled_db import (
     InvalidConnectionError,
@@ -1648,3 +1651,326 @@ def test_dbapi_connection(dbapi):
     assert con is db._con._con
     cursor = db.cursor()
     assert cursor.dbapi_cursor is cursor._cursor
+
+
+# Tests for the per-call waiting timeout of PooledDB.connection()
+
+
+class FakeClock:
+    """A fake monotonic clock controlled by the test."""
+
+    def __init__(self):
+        self.now = 1000.0
+
+    def time(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+
+def coordinated_wait(pool, barrier, result=True):
+    """Replace Condition.wait with a lock-releasing barrier wait.
+
+    Real Condition.wait releases the underlying lock while it blocks;
+    a fake wait must do the same, otherwise the coordinating main thread
+    can deadlock when it acquires the pool lock between barriers.
+    """
+    def fake_wait(timeout=None):
+        pool._lock.release()
+        barrier.wait(5)
+        barrier.wait(5)
+        pool._lock.acquire()
+        return result
+    return fake_wait
+
+
+@pytest.mark.parametrize("timeout, error", [
+    ('1', TypeError),
+    (-0.001, ValueError),
+    (nan, ValueError),
+    (float('inf'), ValueError),
+    (-float('inf'), ValueError),
+    (True, TypeError),
+    (False, TypeError),
+])
+def test_connection_timeout_invalid(dbapi, timeout, error):
+    """Invalid timeout values are rejected before the pool is touched."""
+    pool = PooledDB(dbapi, 1, 1, 1, 1, True)
+    holder = [pool.connection(False)]
+    assert pool._connections == 1
+    with pytest.raises(error):
+        pool.connection(False, timeout=timeout)
+    with pytest.raises(error):
+        pool.dedicated_connection(timeout=timeout)
+    assert pool._connections == 1
+    assert len(pool._idle_cache) == 0
+    # the shared path must reject the value without changing the cache
+    with pytest.raises(error):
+        pool.connection(True, timeout=timeout)
+    assert pool._connections == 1
+    assert not pool._idle_cache
+    assert not pool._shared_cache
+    # on an empty pool the value is rejected before any connection is made
+    pool = PooledDB(dbapi, 0, 0, 1, 1, True)
+    with pytest.raises(error):
+        pool.connection(False, timeout=timeout)
+    assert pool._connections == 0
+    assert not pool._idle_cache
+    with pytest.raises(error):
+        pool.connection(True, timeout=timeout)
+    assert pool._connections == 0
+    assert not pool._shared_cache
+
+
+@pytest.mark.parametrize("shareable", [False, True])
+def test_connection_timeout_zero(dbapi, shareable):
+    """A zero timeout makes one immediate attempt without any waiting."""
+    pool = PooledDB(dbapi, 0, 0, 1, 1, True)
+    holder = [pool.connection(False)]
+    assert pool._connections == 1
+    with pytest.raises(TooManyConnectionsError):
+        pool.connection(shareable, timeout=0)
+    assert pool._connections == 1
+    if shareable:
+        assert not pool._shared_cache
+    del holder
+    # with a connection available, timeout=0 succeeds without waiting
+    db = pool.connection(shareable, timeout=0)
+    assert db
+    db.close()
+    # zero timeout also works on a non-blocking pool
+    pool = PooledDB(dbapi, 0, 0, 1, 1, False)
+    holder = [pool.connection(False)]
+    with pytest.raises(TooManyConnectionsError):
+        pool.connection(shareable, timeout=0)
+    del holder
+
+
+def test_dedicated_connection_timeout(dbapi):
+    """dedicated_connection validates and forwards the timeout."""
+    pool = PooledDB(dbapi, 0, 0, 0, 1, True)
+    with pytest.raises(TypeError):
+        pool.dedicated_connection(timeout=True)
+    db = pool.dedicated_connection(timeout=0)
+    assert db
+    db.close()
+    db = pool.dedicated_connection(timeout=None)
+    assert db
+    db.close()
+    # ints are accepted even though the budget is stored as a float
+    pool = PooledDB(dbapi, 0, 0, 0, 1, True)
+    db = pool.dedicated_connection(timeout=5)
+    db.close()
+
+
+@pytest.mark.parametrize("shareable", [False, True])
+def test_connection_timeout_full_pool(dbapi, shareable, monkeypatch):
+    """A waiting thread gives up when its deadline passes with no return."""
+    clock = FakeClock()
+    monkeypatch.setattr(pooled_db_module, 'monotonic', clock.time)
+    pool = PooledDB(dbapi, 0, 0, 1, 1, True)
+    holder = [pool.connection(False)]
+    assert pool._connections == 1
+    waits = []
+    real_wait = pool._lock.wait
+
+    def recording_wait(timeout=None):
+        waits.append(timeout)
+        barrier.wait(5)  # signal that the worker has entered the wait
+        return real_wait(timeout)
+
+    barrier = Barrier(2)
+    pool._lock.wait = recording_wait
+    errors = []
+
+    def get_connection():
+        try:
+            pool.connection(shareable, timeout=0.2)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    thread = Thread(target=get_connection)
+    thread.start()
+    barrier.wait(5)
+    with pool._lock:
+        clock.advance(0.2)
+        pool._lock.notify_all()
+    thread.join(5)
+    assert not thread.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], TooManyConnectionsError)
+    assert waits == [pytest.approx(0.2)]
+    # the failed call neither created a connection nor touched a cache
+    assert pool._connections == 1
+    assert not pool._idle_cache
+    if shareable:
+        assert not pool._shared_cache
+    del holder
+    assert pool._connections == 0
+    assert len(pool._idle_cache) == 1
+
+
+@pytest.mark.parametrize("shareable", [False, True])
+def test_connection_timeout_spurious_wakeup(
+        dbapi, shareable, monkeypatch):
+    """Repeated spurious wakeups share one deadline, not fresh budgets."""
+    clock = FakeClock()
+    monkeypatch.setattr(pooled_db_module, 'monotonic', clock.time)
+    pool = PooledDB(dbapi, 0, 0, 1, 1, True)
+    holder = [pool.connection(False)]
+    waits = []
+    barrier = Barrier(2)
+
+    def fake_wait(timeout=None):
+        waits.append(timeout)
+        pool._lock.release()
+        barrier.wait(5)  # entered wait
+        barrier.wait(5)  # got woken up (spuriously)
+        pool._lock.acquire()
+        return True
+
+    pool._lock.wait = fake_wait
+    errors = []
+
+    def get_connection():
+        try:
+            pool.connection(shareable, timeout=1.0)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    thread = Thread(target=get_connection)
+    thread.start()
+    # first spurious wakeup after half the budget
+    barrier.wait(5)
+    assert waits == [1.0]
+    clock.advance(0.5)
+    barrier.wait(5)
+    # second wait must use only the remaining half second
+    barrier.wait(5)
+    assert waits == [1.0, 0.5]
+    clock.advance(0.5)
+    barrier.wait(5)
+    # budget exhausted, pool still full: failure without another wait
+    thread.join(5)
+    assert not thread.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], TooManyConnectionsError)
+    assert waits == [1.0, 0.5]
+    assert pool._connections == 1
+    assert not pool._idle_cache
+    if shareable:
+        assert not pool._shared_cache
+    del holder
+
+
+@pytest.mark.parametrize("shareable", [False, True])
+def test_connection_timeout_returned_at_deadline(
+        dbapi, shareable, monkeypatch):
+    """Returning a connection at the deadline still hands it to the waiter."""
+    clock = FakeClock()
+    monkeypatch.setattr(pooled_db_module, 'monotonic', clock.time)
+    pool = PooledDB(dbapi, 0, 1, 1, 1, True)
+    holder = [pool.connection(False)]
+    barrier = Barrier(2)
+    pool._lock.wait = coordinated_wait(pool, barrier, result=False)
+    results = []
+
+    def get_connection():
+        results.append(pool.connection(shareable, timeout=0.2))
+
+    thread = Thread(target=get_connection)
+    thread.start()
+    # while the worker "waits", move the clock to the deadline and return
+    # its connection; cache() notifies before the worker reports a timeout
+    barrier.wait(5)
+    with pool._lock:
+        clock.advance(0.2)
+    holder.pop().close()
+    barrier.wait(5)
+    thread.join(5)
+    assert not thread.is_alive()
+    assert len(results) == 1
+    db = results[0]
+    assert db is not None
+    assert pool._connections == 1
+    if shareable:
+        assert len(pool._shared_cache) == 1
+    db.close()
+    assert pool._connections == 0
+    assert len(pool._idle_cache) == 1
+
+
+def test_connection_timeout_excludes_creation(dbapi, monkeypatch):
+    """Time spent creating the connection is not charged to the budget."""
+    clock = FakeClock()
+    monkeypatch.setattr(pooled_db_module, 'monotonic', clock.time)
+    created = []
+
+    def slow_creator(database=None, user=None):
+        clock.advance(10.0)  # creation takes far longer than the budget
+        created.append(1)
+        return dbapi.connect(database, user)
+
+    slow_creator.threadsafety = dbapi.threadsafety
+    pool = PooledDB(slow_creator, 0, 1, 0, 1, True)
+    holder = [pool.connection(False)]
+    assert created == [1]
+    barrier = Barrier(2)
+    pool._lock.wait = coordinated_wait(pool, barrier, result=True)
+    results = []
+
+    def get_connection():
+        results.append(pool.connection(False, timeout=0.2))
+
+    thread = Thread(target=get_connection)
+    thread.start()
+    barrier.wait(5)  # worker is waiting
+    with pool._lock:
+        clock.advance(0.2)
+    # cache the connection, then remove it from the idle cache while
+    # keeping the bookkeeping: the worker must create a fresh connection
+    # even though the waiting budget is already exhausted
+    holder.pop().close()
+    with pool._lock:
+        assert len(pool._idle_cache) == 1
+        pool._idle_cache.clear()
+        assert pool._connections == 0
+    barrier.wait(5)
+    thread.join(5)
+    assert not thread.is_alive()
+    assert len(results) == 1
+    assert created == [1, 1]
+    assert pool._connections == 1
+    results[0].close()
+
+
+@pytest.mark.parametrize("shareable", [False, True])
+def test_connection_timeout_excludes_ping(
+        dbapi, shareable, monkeypatch, ping_con_cls):
+    """The health check of a reused connection is outside the budget."""
+    clock = FakeClock()
+    monkeypatch.setattr(pooled_db_module, 'monotonic', clock.time)
+    pool = PooledDB(dbapi, 1, 1, 1, 1, True, ping=1)
+    holder = [pool.connection(False)]
+    before_pings = ping_con_cls.num_pings
+    barrier = Barrier(2)
+    pool._lock.wait = coordinated_wait(pool, barrier, result=True)
+    results = []
+
+    def get_connection():
+        results.append(pool.connection(shareable, timeout=0.2))
+
+    thread = Thread(target=get_connection)
+    thread.start()
+    barrier.wait(5)
+    clock.advance(0.2)
+    holder.pop().close()  # back to idle cache, ready for the ping check
+    barrier.wait(5)
+    thread.join(5)
+    assert not thread.is_alive()
+    assert len(results) == 1
+    # the ping runs after the deadline without causing a failure
+    assert ping_con_cls.num_pings > before_pings
+    assert pool._connections == 1
+    results[0].close()
