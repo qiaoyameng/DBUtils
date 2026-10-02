@@ -156,6 +156,7 @@ Licensed under the MIT license.
 from contextlib import suppress
 from functools import total_ordering
 from threading import Condition
+from time import monotonic
 
 from . import __version__
 from .steady_db import connect
@@ -164,7 +165,8 @@ __all__ = [
     'PooledDB', 'PooledDedicatedDBConnection',
     'SharedDBConnection', 'PooledSharedDBConnection',
     'PooledDBError', 'InvalidConnectionError',
-    'NotSupportedError', 'TooManyConnectionsError',
+    'NotSupportedError', 'PoolClosedError', 'PoolShutdownError',
+    'TooManyConnectionsError',
 ]
 
 
@@ -184,9 +186,16 @@ class TooManyConnectionsError(PooledDBError):
     """Too many database connections were opened."""
 
 
+class PoolShutdownError(PooledDBError):
+    """The connection pool is shutting down."""
+
+
 # deprecated alias names for error classes
 InvalidConnection = InvalidConnectionError
 TooManyConnections = TooManyConnectionsError
+
+# convenient alias name for the shutdown state
+PoolClosedError = PoolShutdownError
 
 
 class PooledDB:
@@ -309,6 +318,8 @@ class PooledDB:
         self._idle_cache = []  # the actual pool of idle connections
         self._lock = Condition()
         self._connections = 0
+        self._waiters = 0
+        self._shutdown = False
         # Establish an initial number of idle database connections:
         idle = [self.dedicated_connection() for i in range(mincached)]
         while idle:
@@ -329,10 +340,13 @@ class PooledDB:
         """
         if shareable and self._maxshared:
             with self._lock:
+                self._check_open()
                 while True:
                     while (not self._shared_cache and self._maxconnections
                             and self._connections >= self._maxconnections):
                         self._wait_lock()
+                        self._check_open()
+                    self._check_open()
                     if len(self._shared_cache) < self._maxshared:
                         # shared cache is not full, get a dedicated connection
                         try:  # first try to get it from the idle cache
@@ -355,6 +369,7 @@ class PooledDB:
                         # since by then the connection may have become idle
                         # and been removed from the shared cache altogether
                         self._wait_lock()
+                        self._check_open()
                         continue
                     del self._shared_cache[0]  # get it
                     con.con._ping_check()  # check the underlying connection
@@ -366,9 +381,11 @@ class PooledDB:
             con = PooledSharedDBConnection(self, con)
         else:  # try to get a dedicated connection
             with self._lock:
+                self._check_open()
                 while (self._maxconnections
                         and self._connections >= self._maxconnections):
                     self._wait_lock()
+                    self._check_open()
                 # connection limit not reached, get a dedicated connection
                 try:  # first try to get it from the idle cache
                     con = self._idle_cache.pop(0)
@@ -390,6 +407,22 @@ class PooledDB:
             con.unshare()
             shared = con.shared
             if not shared:  # connection is idle
+                if self._shutdown:
+                    # The pool is draining. Do not reset or cache this
+                    # connection; close it only after its final proxy has
+                    # been returned.
+                    try:
+                        self._shared_cache.remove(con)
+                    except ValueError:
+                        pass
+                    else:
+                        try:
+                            with suppress(Exception):
+                                con.con.close()
+                        finally:
+                            self._connections -= 1
+                            self._lock.notify_all()
+                    return
                 # try to remove it from shared cache
                 with suppress(ValueError):  # if pool has already been closed
                     self._shared_cache.remove(con)
@@ -399,6 +432,14 @@ class PooledDB:
     def cache(self, con):
         """Put a dedicated connection back into the idle cache."""
         with self._lock:
+            if self._shutdown:
+                try:
+                    with suppress(Exception):
+                        con.close()
+                finally:
+                    self._connections -= 1
+                    self._lock.notify_all()
+                return
             if not self._maxcached or len(self._idle_cache) < self._maxcached:
                 con._reset(force=self._reset)  # rollback possible transaction
                 # the idle cache is not full, so put it there
@@ -423,6 +464,48 @@ class PooledDB:
                     self._connections -= 1
             self._lock.notify_all()
 
+    def shutdown(self, timeout=None):
+        """Shut the pool down and wait for borrowed connections to drain."""
+        with self._lock:
+            self._begin_shutdown()
+        return self.drain(timeout)
+
+    def drain(self, timeout=None):
+        """Wait for borrowed connections to be returned and closed.
+
+        Return True when all connections have been drained, or False when
+        the given timeout expired. A timeout leaves borrowed connections
+        and the shutdown state untouched.
+        """
+        deadline = None if timeout is None else monotonic() + timeout
+        with self._lock:
+            if not self._shutdown:
+                self._begin_shutdown()
+            while self._connections or self._waiters:
+                if timeout is None:
+                    self._lock.wait()
+                else:
+                    remaining = deadline - monotonic()
+                    if remaining <= 0:
+                        return False
+                    self._lock.wait(remaining)
+        return True
+
+    def _check_open(self):
+        """Raise an error when the pool is shutting down."""
+        if self._shutdown:
+            raise PoolClosedError
+
+    def _begin_shutdown(self):
+        """Mark the pool as shut down and close idle connections."""
+        if not self._shutdown:
+            self._shutdown = True
+            while self._idle_cache:
+                con = self._idle_cache.pop(0)
+                with suppress(Exception):
+                    con.close()
+            self._lock.notify_all()
+
     def __del__(self):
         """Delete the pool."""
         # builtins (including Exceptions) might not exist anymore
@@ -433,9 +516,18 @@ class PooledDB:
 
     def _wait_lock(self):
         """Wait until notified or report an error."""
+        if self._shutdown:
+            raise PoolClosedError
         if not self._blocking:
             raise TooManyConnectionsError
-        self._lock.wait()
+        self._waiters += 1
+        try:
+            self._lock.wait()
+        finally:
+            self._waiters -= 1
+            self._lock.notify_all()
+        if self._shutdown:
+            raise PoolShutdownError
 
 
 # Auxiliary classes for pooled connections

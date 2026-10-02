@@ -18,6 +18,8 @@ import pytest
 from dbutils.pooled_db import (
     InvalidConnectionError,
     NotSupportedError,
+    PoolClosedError,
+    PoolShutdownError,
     PooledDB,
     SharedDBConnection,
     TooManyConnectionsError,
@@ -392,6 +394,93 @@ def test_close_all_shared_when_pool_is_deleted(dbapi, threadsafety):
     if shareable:
         del cache
     assert closed == ['idle', 'shared']
+
+
+def test_shutdown_drains_shared_transaction_in_steps(dbapi):
+    """Check shutdown waits for every share of a transactional connection."""
+    assert PoolClosedError is PoolShutdownError
+    pool = PooledDB(dbapi, 0, 0, 1)
+    db1 = pool.connection()
+    db2 = pool.connection()
+    con = db1._con
+    assert db2._con is con
+    db1.begin()
+    assert con._con.valid
+
+    drained = pool.shutdown(0.01)
+
+    assert not drained
+    assert con._con.valid
+    assert len(pool._shared_cache) == 1
+    with pytest.raises(PoolClosedError):
+        pool.connection()
+
+    db2.close()
+
+    assert con._con.valid
+    assert con._con.session == []
+    assert len(pool._shared_cache) == 1
+    assert not pool.shutdown(0.01)
+
+    db1.commit()
+    db1.close()
+
+    assert not con._con.valid
+    assert pool._connections == 0
+    assert pool._shared_cache == []
+    assert pool.shutdown(0.01)
+    assert pool.drain()
+
+
+def test_shutdown_wakes_waiting_thread(dbapi):
+    """Check shutdown rejects and wakes threads waiting for a connection."""
+    pool = PooledDB(dbapi, 0, 0, 1, 1, True)
+    db = pool.connection(False)
+    physical_con = db._con._con
+    errors = []
+
+    def connection():
+        try:
+            pool.connection(False)
+        except Exception as error:
+            errors.append(error)
+
+    thread = Thread(target=connection)
+    thread.start()
+    thread.join(0.1)
+    assert thread.is_alive()
+
+    assert pool.shutdown(0.01) is False
+    thread.join(0.1)
+
+    assert not thread.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], PoolShutdownError)
+    assert pool._waiters == 0
+    assert not pool.shutdown(0.01)
+
+    db.close()
+
+    assert not physical_con.valid
+    assert pool._connections == 0
+    assert pool.drain(0.01)
+
+
+def test_drain_starts_shutdown_for_dedicated_connection(dbapi):
+    """Check drain can begin the shutdown lifecycle itself."""
+    pool = PooledDB(dbapi, 0, 0, 0)
+    db = pool.connection(False)
+    con = db._con._con
+
+    assert not pool.drain(0.01)
+    with pytest.raises(PoolShutdownError):
+        pool.connection(False)
+
+    db.close()
+
+    assert not con.valid
+    assert pool._connections == 0
+    assert pool.drain(0.01)
 
 
 @pytest.mark.parametrize("threadsafety", [1, 2])
