@@ -118,6 +118,8 @@ Copyright, credits and license:
 Licensed under the MIT license.
 """
 
+import os
+
 from . import __version__
 from .steady_db import connect
 
@@ -222,7 +224,27 @@ class PersistentDB:
         self._ping = ping
         self._closeable = closeable
         self._args, self._kwargs = args, kwargs
-        self.thread = (threadlocal or local)()
+        # Remember the process the pool was created in, so that we can
+        # detect when the pool is used in a child process after fork().
+        self._pid = os.getpid() if hasattr(os, 'fork') else None
+        self._threadlocal = threadlocal or local
+        self.thread = self._threadlocal()
+
+    def _check_pid(self):
+        """Check whether the pool is used in the process that created it.
+
+        If the process id has changed, then we are running in a child
+        process that inherited the pool via fork().  In this case, the
+        thread-local cache is discarded without touching any inherited
+        connection, since it belongs to the parent process and may be
+        in the middle of a transaction there.  The child process then
+        transparently creates its own persistent connection, using the
+        same creator and session initialization settings.
+        """
+        pid = self._pid
+        if pid is not None and pid != os.getpid():
+            self._pid = os.getpid()
+            self.thread = self._threadlocal()
 
     def steady_connection(self):
         """Get a steady, non-persistent DB-API 2 connection."""
@@ -238,6 +260,7 @@ class PersistentDB:
         PooledDB connection method.  In reality, persistent connections
         are of course never shared with other threads.
         """
+        self._check_pid()
         try:
             con = self.thread.connection
         except AttributeError as error:

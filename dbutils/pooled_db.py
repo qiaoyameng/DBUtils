@@ -153,6 +153,7 @@ Copyright, credits and license:
 Licensed under the MIT license.
 """
 
+import os
 from contextlib import suppress
 from functools import total_ordering
 from threading import Condition
@@ -297,7 +298,6 @@ class PooledDB:
             self._maxcached = 0
         if threadsafety > 1 and maxshared:
             self._maxshared = maxshared
-            self._shared_cache = []  # the cache for shared connections
         else:
             self._maxshared = 0
         if maxconnections:
@@ -306,13 +306,43 @@ class PooledDB:
             self._maxconnections = maxconnections
         else:
             self._maxconnections = 0
-        self._idle_cache = []  # the actual pool of idle connections
-        self._lock = Condition()
-        self._connections = 0
+        # Remember the process the pool was created in, so that we can
+        # detect when the pool is used in a child process after fork().
+        self._pid = os.getpid() if hasattr(os, 'fork') else None
+        self._init_pool_state()
         # Establish an initial number of idle database connections:
         idle = [self.dedicated_connection() for i in range(mincached)]
         while idle:
             idle.pop().close()
+
+    def _init_pool_state(self):
+        """(Re)set the mutable state of the connection pool.
+
+        This is called when the pool is created and again when it is
+        first used in a child process created with fork(), so that the
+        child process gets its own pool state with its own connections.
+        """
+        self._idle_cache = []  # the actual pool of idle connections
+        if self._maxshared:
+            self._shared_cache = []  # the cache for shared connections
+        self._lock = Condition()
+        self._connections = 0
+
+    def _check_pid(self):
+        """Check whether the pool is used in the process that created it.
+
+        If the process id has changed, then we are running in a child
+        process that inherited the pool via fork().  In this case, the
+        pool state is reinitialized without touching any of the inherited
+        connections, since they belong to the parent process and may be
+        in the middle of a transaction there.  The child process then
+        transparently builds up its own pool with its own connections,
+        using the same creator and session initialization settings.
+        """
+        pid = self._pid
+        if pid is not None and pid != os.getpid():
+            self._pid = os.getpid()
+            self._init_pool_state()
 
     def steady_connection(self):
         """Get a steady, unpooled DB-API 2 connection."""
@@ -327,6 +357,7 @@ class PooledDB:
         If shareable is set and the underlying DB-API 2 allows it,
         then the connection may be shared with other threads.
         """
+        self._check_pid()
         if shareable and self._maxshared:
             with self._lock:
                 while True:
@@ -386,6 +417,7 @@ class PooledDB:
 
     def unshare(self, con):
         """Decrease the share of a connection in the shared cache."""
+        self._check_pid()
         with self._lock:
             con.unshare()
             shared = con.shared
@@ -398,6 +430,7 @@ class PooledDB:
 
     def cache(self, con):
         """Put a dedicated connection back into the idle cache."""
+        self._check_pid()
         with self._lock:
             if not self._maxcached or len(self._idle_cache) < self._maxcached:
                 con._reset(force=self._reset)  # rollback possible transaction
@@ -410,6 +443,7 @@ class PooledDB:
 
     def close(self):
         """Close all connections in the pool."""
+        self._check_pid()
         with self._lock:
             while self._idle_cache:  # close all idle connections
                 con = self._idle_cache.pop(0)
@@ -451,22 +485,37 @@ class PooledDedicatedDBConnection:
         """
         # basic initialization to make finalizer work
         self._con = None
+        self._pid = None
         # proper initialization of the connection
         if not con.threadsafety():
             raise NotSupportedError("Database module is not thread-safe.")
         self._pool = pool
         self._con = con
+        self._pid = pool._pid
 
     def close(self):
         """Close the pooled dedicated connection."""
         # Instead of actually closing the connection,
         # return it to the pool for future reuse.
+        self._check_pid()
         if self._con:
             self._pool.cache(self._con)
             self._con = None
 
+    def _check_pid(self):
+        """Check that the connection is used in the process that got it.
+
+        Connections borrowed in a parent process must not be used in a
+        child process created with fork(), since they belong to the pool
+        of the parent process and may be in the middle of a transaction.
+        """
+        if self._pid is not None and self._pid != os.getpid():
+            raise InvalidConnectionError(
+                "Pooled connection was created in another process.")
+
     def __getattr__(self, name):
         """Proxy all members of the class."""
+        self._check_pid()
         if self._con:
             return getattr(self._con, name)
         raise InvalidConnectionError
@@ -540,6 +589,7 @@ class PooledSharedDBConnection:
         """
         # basic initialization to make finalizer work
         self._con = None
+        self._pid = None
         # proper initialization of the connection
         con = shared_con.con
         if not con.threadsafety() > 1:
@@ -547,17 +597,31 @@ class PooledSharedDBConnection:
         self._pool = pool
         self._shared_con = shared_con
         self._con = con
+        self._pid = pool._pid
 
     def close(self):
         """Close the pooled shared connection."""
         # Instead of actually closing the connection,
         # unshare it and/or return it to the pool.
+        self._check_pid()
         if self._con:
             self._pool.unshare(self._shared_con)
             self._shared_con = self._con = None
 
+    def _check_pid(self):
+        """Check that the connection is used in the process that got it.
+
+        Connections borrowed in a parent process must not be used in a
+        child process created with fork(), since they belong to the pool
+        of the parent process and may be in the middle of a transaction.
+        """
+        if self._pid is not None and self._pid != os.getpid():
+            raise InvalidConnectionError(
+                "Pooled connection was created in another process.")
+
     def __getattr__(self, name):
         """Proxy all members of the class."""
+        self._check_pid()
         if self._con:
             return getattr(self._con, name)
         raise InvalidConnectionError
