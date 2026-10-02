@@ -409,6 +409,12 @@ Instead of this, you can also get a dedicated connection as follows::
 If you don't need it anymore, you should immediately return it to the
 pool with ``db.close()``. You can get another connection in the same way.
 
+If a connection has become unusable, you can also remove it completely
+from the pool with ``db.invalidate()`` instead of returning it to the pool.
+The underlying connection will be closed, all proxies sharing the same
+connection will raise an ``InvalidConnectionError`` when they try to use
+it, and the pool can immediately open a replacement connection.
+
 .. warning::
     In a threaded environment, never do the following::
 

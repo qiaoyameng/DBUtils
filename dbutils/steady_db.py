@@ -200,6 +200,7 @@ class SteadyDBConnection:
         # basic initialization to make finalizer work
         self._con = None
         self._closed = True
+        self._invalidated = False
         # proper initialization of the connection
         try:
             self._creator = creator.connect
@@ -397,6 +398,16 @@ class SteadyDBConnection:
             self._transaction = False
             self._closed = True
 
+    def _invalidate(self):
+        """Invalidate the tough connection.
+
+        This closes the underlying connection and marks the tough
+        connection as invalid, so that it cannot be used any more
+        and will not be transparently reopened.
+        """
+        self._invalidated = True
+        self._close()
+
     def _reset(self, force=False):
         """Reset a tough connection.
 
@@ -438,7 +449,7 @@ class SteadyDBConnection:
                 alive = True
             if alive:
                 reconnect = False
-            if reconnect and not self._transaction:
+            if reconnect and not self._transaction and not self._invalidated:
                 try:  # try to reopen the connection
                     con = self._create()
                 except Exception:  # noqa: S110
@@ -506,6 +517,8 @@ class SteadyDBConnection:
         If the underlying driver supports this method, it will be called
         with the given parameters (e.g. for distributed transactions).
         """
+        if self._invalidated:
+            raise self._failure('connection has been invalidated')
         self._transaction = True
         try:
             begin = self._con.begin
@@ -516,6 +529,8 @@ class SteadyDBConnection:
 
     def commit(self):
         """Commit any pending transaction."""
+        if self._invalidated:
+            raise self._failure('connection has been invalidated')
         self._transaction = False
         try:
             self._con.commit()
@@ -531,6 +546,8 @@ class SteadyDBConnection:
 
     def rollback(self):
         """Rollback pending transaction."""
+        if self._invalidated:
+            raise self._failure('connection has been invalidated')
         self._transaction = False
         try:
             self._con.rollback()
@@ -569,6 +586,8 @@ class SteadyDBConnection:
         # The args and kwargs are not part of the standard,
         # but some database modules seem to use these.
         transaction = self._transaction
+        if self._invalidated:
+            raise self._failure('connection has been invalidated')
         if not transaction:
             self._ping_check(2)
         overused = False
@@ -730,6 +749,8 @@ class SteadyDBCursor:
         def tough_method(*args, **kwargs):
             execute = name.startswith('execute')
             con = self._con
+            if con._invalidated:
+                raise con._failure('connection has been invalidated')
             transaction = con._transaction
             if not transaction:
                 con._ping_check(4)

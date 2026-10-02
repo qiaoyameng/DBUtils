@@ -107,6 +107,12 @@ You can also use this to get a dedicated connection:
 If you don't need it anymore, you should immediately return it to the
 pool with db.close().  You can get another connection in the same way.
 
+If a connection has become unusable, you can also remove it completely
+from the pool with db.invalidate() instead of returning it to the pool.
+The underlying connection will be closed, all proxies sharing the same
+connection will raise an InvalidConnectionError when they try to use it,
+and the pool can immediately open a replacement connection.
+
 Warning: In a threaded environment, never do the following:
 
     pool.connection().cursor().execute(...)
@@ -393,8 +399,33 @@ class PooledDB:
                 # try to remove it from shared cache
                 with suppress(ValueError):  # if pool has already been closed
                     self._shared_cache.remove(con)
-        if not shared:  # connection has become idle,
-            self.cache(con.con)  # so add it to the idle cache
+        if not shared and not con.invalidated:
+            # connection has become idle, so add it to the idle cache
+            self.cache(con.con)
+
+    def invalidate(self, con):
+        """Invalidate a connection, removing it from the pool.
+
+        The connection is closed and will not be returned to the pool,
+        so that the pool can immediately open a replacement connection.
+        """
+        if isinstance(con, SharedDBConnection):
+            # a shared connection is always invalidated as a whole
+            with self._lock:
+                if con.invalidated:
+                    return  # connection has already been invalidated
+                con.invalidate()
+                # try to remove it from the shared cache
+                with suppress(ValueError):  # if pool has already been closed
+                    self._shared_cache.remove(con)
+                self._connections -= 1
+                self._lock.notify()
+            con = con.con
+        else:
+            with self._lock:
+                self._connections -= 1
+                self._lock.notify()
+        con._invalidate()  # close the underlying connection
 
     def cache(self, con):
         """Put a dedicated connection back into the idle cache."""
@@ -465,6 +496,16 @@ class PooledDedicatedDBConnection:
             self._pool.cache(self._con)
             self._con = None
 
+    def invalidate(self):
+        """Invalidate the pooled dedicated connection.
+
+        The underlying connection is closed and removed from the pool
+        instead of being returned to the idle cache for later reuse.
+        """
+        if self._con:
+            self._pool.invalidate(self._con)
+            self._con = None
+
     def __getattr__(self, name):
         """Proxy all members of the class."""
         if self._con:
@@ -499,6 +540,7 @@ class SharedDBConnection:
         """
         self.con = con
         self.shared = 1
+        self.invalidated = False
 
     def __lt__(self, other):
         """Check whether this connection should come before the other one."""
@@ -528,6 +570,10 @@ class SharedDBConnection:
         """Decrease the share of this connection."""
         self.shared -= 1
 
+    def invalidate(self):
+        """Mark the shared connection as invalidated."""
+        self.invalidated = True
+
 
 class PooledSharedDBConnection:
     """Auxiliary proxy class for pooled shared connections."""
@@ -556,9 +602,20 @@ class PooledSharedDBConnection:
             self._pool.unshare(self._shared_con)
             self._shared_con = self._con = None
 
+    def invalidate(self):
+        """Invalidate the pooled shared connection.
+
+        The underlying connection is closed and removed from the pool.
+        All proxies sharing the same connection will get an error when
+        they try to use it, but they still need to be closed to release
+        their share of the connection.
+        """
+        if self._con:
+            self._pool.invalidate(self._shared_con)
+
     def __getattr__(self, name):
         """Proxy all members of the class."""
-        if self._con:
+        if self._con and not self._shared_con.invalidated:
             return getattr(self._con, name)
         raise InvalidConnectionError
 

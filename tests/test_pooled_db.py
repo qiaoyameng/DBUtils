@@ -501,6 +501,148 @@ def test_unshare_connection(dbapi, threadsafety):
         assert len(pool._idle_cache) == 3
 
 
+def test_invalidate_shared_connection(dbapi, monkeypatch):
+    """Check that a shared connection can be invalidated."""
+    # count the physical connections that are actually closed
+    closes = []
+    close = dbapi.Connection.close
+
+    def counted_close(self):
+        closes.append(self)
+        close(self)
+
+    monkeypatch.setattr(dbapi.Connection, 'close', counted_close)
+    pool = PooledDB(dbapi, 0, 0, 1, 3)
+    # get two proxies sharing the same physical connection
+    db1 = pool.connection()
+    db2 = pool.connection()
+    assert db1._con is db2._con
+    assert db1._shared_con.shared == 2
+    # and one dedicated proxy with a connection of its own
+    db3 = pool.dedicated_connection()
+    assert db3._con is not db1._con
+    assert pool._connections == 2
+    shared_con = db1._shared_con
+    steady_con = db1._con
+    physical_con = steady_con._con
+    # invalidate the shared connection via one of the two proxies
+    db1.invalidate()
+    assert shared_con.invalidated
+    assert pool._connections == 1
+    assert len(pool._shared_cache) == 0
+    assert len(closes) == 1  # the physical connection has been closed
+    assert not physical_con.valid
+    # invalidating it again has no effect
+    db1.invalidate()
+    db2.invalidate()
+    assert pool._connections == 1
+    assert len(closes) == 1
+    # both proxies of the same connection now get a clear error
+    with pytest.raises(InvalidConnectionError):
+        db1.cursor()
+    with pytest.raises(InvalidConnectionError):
+        db2.cursor()
+    # the dedicated connection is not affected
+    cursor = db3.cursor()
+    cursor.execute('select ok')
+    assert cursor.fetchone() == 'ok'
+    # returning the other proxy must not put the invalidated connection
+    # back into the idle cache or decrease the connection count again
+    db2.close()
+    assert len(pool._idle_cache) == 0
+    assert pool._connections == 1
+    assert len(closes) == 1
+    db1.close()
+    assert pool._connections == 1
+    assert len(closes) == 1
+    # a new checkout creates a replacement connection
+    db4 = pool.connection()
+    assert pool._connections == 2  # the replacement takes one new slot
+    assert db4._con is not steady_con
+    assert db4._con._con.valid
+    cursor = db4.cursor()
+    cursor.execute('select ok')
+    assert cursor.fetchone() == 'ok'
+    db4.close()
+    assert pool._connections == 1
+    db3.close()
+    assert pool._connections == 0
+    assert len(closes) == 1  # still only the invalidated connection
+
+
+def test_invalidate_shared_connection_in_transaction(dbapi):
+    """Check that invalidation does not silently replay transactions."""
+    pool = PooledDB(dbapi, 0, 0, 1, 2)
+    db1 = pool.connection()
+    db2 = pool.connection()
+    assert db1._con is db2._con
+    db1.begin()
+    cursor = db1.cursor()
+    cursor.execute('select tx')
+    assert cursor.fetchone() == 'tx'
+    db1.invalidate()
+    # operations on the shared proxies must not be replayed
+    with pytest.raises(InvalidConnectionError):
+        db1.cursor()
+    with pytest.raises(InvalidConnectionError):
+        db2.cursor()
+    with pytest.raises(InvalidConnectionError):
+        db1.commit()
+    # even a cursor created before the invalidation must not fail over
+    with pytest.raises(dbapi.OperationalError):
+        cursor.execute('select tx')
+    db1.close()
+    db2.close()
+    assert pool._connections == 0
+    assert len(pool._idle_cache) == 0
+
+
+def test_invalidate_dedicated_connection(dbapi, monkeypatch):
+    """Check that a dedicated connection can be invalidated."""
+    # count the physical connections that are actually closed
+    closes = []
+    close = dbapi.Connection.close
+
+    def counted_close(self):
+        closes.append(self)
+        close(self)
+
+    monkeypatch.setattr(dbapi.Connection, 'close', counted_close)
+    pool = PooledDB(dbapi, 0, 0, 1, 2)
+    db1 = pool.dedicated_connection()
+    db2 = pool.connection()
+    assert pool._connections == 2
+    steady_con = db1._con
+    physical_con = steady_con._con
+    db1.invalidate()
+    assert pool._connections == 1
+    assert len(closes) == 1  # the physical connection has been closed
+    assert not physical_con.valid
+    with pytest.raises(InvalidConnectionError):
+        db1.cursor()
+    # closing the invalidated proxy must not cache it or count it again
+    db1.close()
+    assert pool._connections == 1
+    assert len(pool._idle_cache) == 0
+    assert len(closes) == 1
+    # invalidating it again has no effect
+    db1.invalidate()
+    assert pool._connections == 1
+    assert len(closes) == 1
+    # the shared connection is not affected
+    cursor = db2.cursor()
+    cursor.execute('select ok')
+    assert cursor.fetchone() == 'ok'
+    # a new checkout creates a replacement connection
+    db3 = pool.dedicated_connection()
+    assert pool._connections == 2  # the replacement takes one new slot
+    assert db3._con is not steady_con
+    db3.close()
+    db2.close()
+    assert pool._connections == 0
+    assert len(closes) == 1  # still only the invalidated connection
+
+
 @pytest.mark.parametrize("threadsafety", [1, 2])
 @pytest.mark.parametrize(("mincached", "maxcached", "cached", "rounds"), [
     # every round takes the given number of connections out of the pool
@@ -1520,6 +1662,7 @@ def test_shared_db_connection_create(dbapi):
     con = SharedDBConnection(db_con)
     assert con.con == db_con
     assert con.shared == 1
+    assert not con.invalidated
 
 
 def test_shared_db_connection_share_and_unshare(dbapi):
@@ -1534,6 +1677,14 @@ def test_shared_db_connection_share_and_unshare(dbapi):
     assert con.shared == 2
     con.unshare()
     assert con.shared == 1
+
+
+def test_shared_db_connection_invalidate(dbapi):
+    """Check that a shared connection can be marked as invalidated."""
+    con = SharedDBConnection(dbapi.connect())
+    assert not con.invalidated
+    con.invalidate()
+    assert con.invalidated
 
 
 def test_shared_db_connection_compare(dbapi):

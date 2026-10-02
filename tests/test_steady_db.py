@@ -158,6 +158,28 @@ def test_close(closeable):
     assert not db._con.valid
 
 
+def test_invalidate():
+    """Check that an invalidated connection is not reopened."""
+    db = steady_db_connect(dbapi)
+    con = db._con
+    assert con.valid
+    db._invalidate()
+    assert db._invalidated
+    assert db._closed
+    assert not con.valid
+    # the connection must not be transparently reopened
+    with pytest.raises(dbapi.OperationalError):
+        db.cursor()
+    with pytest.raises(dbapi.OperationalError):
+        db.begin()
+    with pytest.raises(dbapi.OperationalError):
+        db.commit()
+    with pytest.raises(dbapi.OperationalError):
+        db.rollback()
+    assert db._con is con
+    assert not con.valid
+
+
 def test_connection():
     """Check that the connection wraps the DB-API 2 connection."""
     db = steady_db_connect(
